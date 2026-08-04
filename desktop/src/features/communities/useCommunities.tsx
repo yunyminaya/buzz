@@ -17,6 +17,7 @@ import {
   saveCommunities,
 } from "./communityStorage";
 import { removeSelfProfileCachesForRelay } from "@/features/profile/lib/selfProfileStorage";
+import { removeUserLabelCacheForRelay } from "@/features/profile/lib/userLabelStorage";
 import { removeChannelSnapshotForRelay } from "@/features/channels/channelSnapshot";
 import { removeMessageSnapshotsForRelay } from "@/features/messages/lib/messageSnapshot";
 import { clearSavedCommunitySnapshot } from "@/features/agents/activeAgentTurnsStore";
@@ -231,6 +232,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       // Keep side effects outside the updater — updaters can execute twice under
       // React StrictMode.
       removeSelfProfileCachesForRelay(removed.relayUrl);
+      removeUserLabelCacheForRelay(removed.relayUrl);
       removeChannelSnapshotForRelay(removed.relayUrl);
       removeMessageSnapshotsForRelay(removed.relayUrl);
       clearSavedCommunitySnapshot(id);
