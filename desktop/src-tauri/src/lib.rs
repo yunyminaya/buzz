@@ -596,18 +596,19 @@ pub fn run() {
                     }
                 });
             }
-            crate::managed_agents::spawn_boot_recovery(app.handle());
-
             // File-commit recovery runs synchronously under the advisory lock
-            // BEFORE the invoke handler admits any store commands.  This
-            // ensures the JSON store is in a consistent state (no dangling
-            // *.stage files) before any mutation can arrive.  Publication
-            // re-drive (outbox → relay) stays in the background spawn above.
+            // BEFORE spawn_boot_recovery is called.  This ensures the JSON
+            // store is in a consistent state (no dangling *.stage files)
+            // before the background task or any command can arrive.
+            // File repair has exactly ONE owner: this synchronous call.
+            // spawn_boot_recovery is publication-only — it does NOT run
+            // recover_interrupted_file_commits.
             if let Err(e) =
                 crate::managed_agents::store_journal::run_file_commit_recovery(app.handle())
             {
                 eprintln!("buzz-desktop: file-commit-recovery: {e}");
             }
+            crate::managed_agents::spawn_boot_recovery(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

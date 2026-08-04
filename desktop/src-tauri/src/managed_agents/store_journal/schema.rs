@@ -120,30 +120,86 @@ pub(super) fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("apply journal schema: {e}"))?;
 
-    // Schema version 3: add content-hash columns for verifiable file-commit
-    // recovery. ALTER TABLE ... ADD COLUMN is ignored on fresh DBs (columns
-    // already exist from CREATE TABLE above).
+    // Schema upgrades (v3: content-hash columns; v4: retention_d_tag).
+    //
+    // We inspect existing columns via PRAGMA table_info (not "duplicate column"
+    // errors) so genuine failures (SQLITE_BUSY, disk full, corrupt schema) are
+    // propagated and the version is NOT silently advanced on partial migration.
+    // All ADD COLUMN operations and the user_version stamp happen inside a
+    // single transaction so the DB cannot be left half-migrated with a
+    // "completed" version stamp.
     let current_version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap_or(0);
-    if current_version < 3 {
-        let _ = conn.execute_batch(
-            "ALTER TABLE file_commit_phases ADD COLUMN agents_content_hash TEXT NOT NULL DEFAULT '';
-             ALTER TABLE file_commit_phases ADD COLUMN teams_content_hash  TEXT NOT NULL DEFAULT '';",
-        );
-    }
-    // Schema version 4: add retention_d_tag column to outbox_events.
-    // Persists the exact retention coordinate (d_tag) used at enqueue time so
-    // boot recovery can re-insert at the same (kind, pubkey, d_tag) coordinate
-    // without re-parsing the event payload — necessary for kinds like 5 and
-    // 9035 that carry no d-tag in the event itself.
+
     if current_version < 4 {
-        let _ = conn.execute_batch(
-            "ALTER TABLE outbox_events ADD COLUMN retention_d_tag TEXT NOT NULL DEFAULT '';",
-        );
+        // Read existing column names BEFORE opening the transaction.
+        // PRAGMA table_info cannot run inside a BEGIN on some SQLite builds.
+        let fcp_cols = table_column_names(conn, "file_commit_phases")?;
+        let oe_cols = table_column_names(conn, "outbox_events")?;
+        let need_agents_hash = !fcp_cols.contains(&"agents_content_hash".to_string());
+        let need_teams_hash = !fcp_cols.contains(&"teams_content_hash".to_string());
+        let need_d_tag = !oe_cols.contains(&"retention_d_tag".to_string());
+
+        // Run all ADD COLUMN calls and the version stamp in one transaction.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin migration transaction: {e}"))?;
+        if need_agents_hash {
+            tx.execute_batch(
+                "ALTER TABLE file_commit_phases ADD COLUMN agents_content_hash TEXT NOT NULL DEFAULT \'\';",
+            )
+            .map_err(|e| format!("add agents_content_hash: {e}"))?;
+        }
+        if need_teams_hash {
+            tx.execute_batch(
+                "ALTER TABLE file_commit_phases ADD COLUMN teams_content_hash TEXT NOT NULL DEFAULT \'\';",
+            )
+            .map_err(|e| format!("add teams_content_hash: {e}"))?;
+        }
+        if need_d_tag {
+            tx.execute_batch(
+                "ALTER TABLE outbox_events ADD COLUMN retention_d_tag TEXT NOT NULL DEFAULT \'\';",
+            )
+            .map_err(|e| format!("add retention_d_tag: {e}"))?;
+        }
+        tx.pragma_update(None, "user_version", 4)
+            .map_err(|e| format!("set schema user_version to 4: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit migration transaction: {e}"))?;
+
+        // Post-migration verification (after commit — PRAGMA runs outside tx).
+        let fcp_after = table_column_names(conn, "file_commit_phases")?;
+        let oe_after = table_column_names(conn, "outbox_events")?;
+        for col in &["agents_content_hash", "teams_content_hash"] {
+            if !fcp_after.contains(&col.to_string()) {
+                return Err(format!(
+                    "schema migration: file_commit_phases.{col} absent after migration"
+                ));
+            }
+        }
+        if !oe_after.contains(&"retention_d_tag".to_string()) {
+            return Err(
+                "schema migration: outbox_events.retention_d_tag absent after migration"
+                    .to_string(),
+            );
+        }
     }
-    conn.pragma_update(None, "user_version", 4)
-        .map_err(|e| format!("set schema user_version to 4: {e}"))?;
 
     Ok(())
+}
+
+/// Return the column names of `table` via `PRAGMA table_info`.
+fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| format!("PRAGMA table_info({table}): {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("query table_info({table}): {e}"))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row.map_err(|e| format!("read table_info({table}) row: {e}"))?);
+    }
+    Ok(names)
 }

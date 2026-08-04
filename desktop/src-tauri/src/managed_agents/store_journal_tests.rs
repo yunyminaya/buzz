@@ -917,12 +917,10 @@ fn insert_file_commit_phase_row(conn: &Connection, cid: &str, phase: &str, as_: 
 }
 
 /// Three crash scenarios for the two-phase file-commit protocol (intent,
-/// first_renamed+pending, first_renamed+done), driven by `run_boot_recovery_at`.
+/// first_renamed+pending, first_renamed+done), driven by file commit recovery.
 #[test]
 #[allow(clippy::type_complexity)]
 fn test_crash_recovery_file_commit_phases() {
-    use super::run_boot_recovery_at;
-
     // (phase, commit_id, [a_stage,t_stage,a_can,t_can] pre-exist, a_can post, t_can post, pubkey)
     let cases: &[(&str, &str, [bool; 4], bool, bool, &str)] = &[
         (
@@ -977,7 +975,7 @@ fn test_crash_recovery_file_commit_phases() {
             t_stage.to_str().unwrap(),
         );
         drop(j);
-        run_boot_recovery_at(&anchor, None).unwrap();
+        super::file_commit_recovery_at_pub(&anchor).unwrap();
         assert_eq!(a_can.exists(), *a_exists, "{pk} agents_can");
         assert_eq!(t_can.exists(), *t_exists, "{pk} teams_can");
         if *a_exists {

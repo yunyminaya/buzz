@@ -67,7 +67,7 @@ pub use txn::{
 };
 #[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use txn::{read_store, run_boot_recovery_at};
+pub(crate) use txn::{file_commit_recovery_at_pub, read_store, run_boot_recovery_at};
 
 pub use util::new_operation_id;
 

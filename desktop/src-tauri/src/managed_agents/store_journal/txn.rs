@@ -412,29 +412,23 @@ pub fn run_boot_recovery(
     run_boot_recovery_at(&anchor, retention_path.as_deref())
 }
 
-/// Path-level boot recovery, extracted so tests can call it without an AppHandle.
+/// Path-level boot recovery — **publication-only** (no file repair).
 ///
-/// `retention_db_path` is the path to the anchor's active scoped retention DB.  When
-/// `Some`, recovery can re-insert missing `pending_sync` retention rows from
+/// File-commit recovery (phase 1) is handled exclusively by the synchronous
+/// `run_file_commit_recovery` call in app setup, which runs BEFORE this
+/// background task is spawned.  This function runs only phase 2: publication
+/// recovery (outbox re-drive into the retention DB).
+///
+/// `retention_db_path` is the path to the anchor's active scoped retention DB.
+/// When `Some`, recovery re-inserts missing `pending_sync` retention rows from
 /// journal outbox payloads so the flush loop can re-publish them.  When `None`,
 /// recovery logs the gap and leaves the outbox row pending for the next boot.
-///
-/// **File-commit recovery runs under the anchored advisory lock** so it cannot
-/// race a concurrent `mutate_store` call.  Publication recovery (outbox re-drive)
-/// runs under its own journal connection; it does not rename files and does not
-/// require the lock.
 pub(crate) fn run_boot_recovery_at(
     anchor: &std::path::Path,
     retention_db_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    // Phase 1: file-commit recovery — must hold the advisory lock so a
-    // concurrent mutate_store cannot race the same *.stage paths.
-    {
-        let _advisory = super::lock::JournalLockGuard::acquire(anchor)?;
-        let journal = open_journal(anchor)?;
-        recover_interrupted_file_commits(&journal)?;
-    }
-    // Phase 2: publication recovery — no file I/O, no lock required.
+    // Publication recovery only — no file I/O, no lock required.
+    // File-commit repair is the sole responsibility of run_file_commit_recovery.
     let journal = open_journal(anchor)?;
     recover_nonterminal_operations(&journal, retention_db_path)?;
     Ok(())
@@ -448,8 +442,18 @@ pub(crate) fn run_boot_recovery_at(
 pub fn run_file_commit_recovery(app: &AppHandle) -> Result<(), String> {
     let anchor = store_anchor_dir(app)?;
     std::fs::create_dir_all(&anchor).map_err(|e| format!("boot-recovery create anchor: {e}"))?;
-    let _advisory = super::lock::JournalLockGuard::acquire(&anchor)?;
-    let journal = open_journal(&anchor)?;
+    file_commit_recovery_at(&anchor)
+}
+
+/// Path-level file-commit recovery, extracted for testing without an AppHandle.
+#[cfg(test)]
+pub(crate) fn file_commit_recovery_at_pub(anchor: &std::path::Path) -> Result<(), String> {
+    file_commit_recovery_at(anchor)
+}
+
+fn file_commit_recovery_at(anchor: &std::path::Path) -> Result<(), String> {
+    let _advisory = super::lock::JournalLockGuard::acquire(anchor)?;
+    let journal = open_journal(anchor)?;
     recover_interrupted_file_commits(&journal)
 }
 
