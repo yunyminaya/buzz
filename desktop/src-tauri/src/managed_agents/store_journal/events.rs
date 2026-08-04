@@ -20,20 +20,25 @@ pub enum InsertEventOutcome {
 /// Insert an immutable outbox row.  Fail-closed on identity collision:
 /// a duplicate event_id is only accepted when operation_id and payload
 /// are byte-identical.
+///
+/// `retention_d_tag` is the exact d_tag used in the retention coordinate at
+/// enqueue time — persisted so boot recovery can re-insert at the same
+/// `(kind, pubkey, d_tag)` without re-parsing the event payload.
 pub fn insert_outbox_event(
     conn: &Connection,
     event_id: &str,
     operation_id: &str,
     payload: &[u8],
+    retention_d_tag: &str,
 ) -> Result<InsertEventOutcome, String> {
     let now = unix_now_secs();
     // Try an unconditional insert first.
     let affected = conn
         .execute(
             "INSERT OR IGNORE INTO outbox_events
-                 (event_id, operation_id, payload, published_state, created_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            params![event_id, operation_id, payload, now],
+                 (event_id, operation_id, payload, published_state, retention_d_tag, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![event_id, operation_id, payload, retention_d_tag, now],
         )
         .map_err(|e| format!("insert_outbox_event({event_id}): {e}"))?;
 
@@ -117,19 +122,20 @@ pub fn insert_inbox_event(
 }
 
 /// Read outbox events for `operation_id`.
+#[allow(clippy::type_complexity)]
 pub fn read_outbox_events(
     conn: &Connection,
     operation_id: &str,
-) -> Result<Vec<(String, Vec<u8>, i64)>, String> {
+) -> Result<Vec<(String, Vec<u8>, i64, String)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT event_id, payload, published_state FROM outbox_events
+            "SELECT event_id, payload, published_state, retention_d_tag FROM outbox_events
              WHERE operation_id = ?1 ORDER BY created_at",
         )
         .map_err(|e| format!("prepare outbox query: {e}"))?;
     let rows = stmt
         .query_map(params![operation_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .map_err(|e| format!("query outbox: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()

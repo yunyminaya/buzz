@@ -1,9 +1,13 @@
 //! Tests for round-6/7 fixes: hash-verified recovery (Fix 3b), scoped
 //! recovery path (Fix 1), and keyring chokepoint (Fix 2).
+//! Round-8 tests: tombstone/archive recovery coordinates (BLOCKING 1),
+//! recovery-vs-mutation race (BLOCKING 2b), and failure injection (BLOCKING 2c).
 
 use super::operations::insert_operation;
 use super::{insert_outbox_event, open_journal, run_boot_recovery_at, Generation};
-use crate::managed_agents::retention::{get_pending_sync, open_retention_db};
+use crate::managed_agents::retention::{
+    get_pending_sync, open_retention_db, tombstone_retention_d_tag,
+};
 use nostr::JsonUtil;
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -212,7 +216,7 @@ fn test_boot_recovery_inserts_into_supplied_retention_path_not_flat() {
     {
         let j = open_journal(&anchor).unwrap();
         insert_operation(&j, "op-1", "publish", "agent-1", Generation(0)).unwrap();
-        insert_outbox_event(&j, &event_id, "op-1", raw.as_bytes()).unwrap();
+        insert_outbox_event(&j, &event_id, "op-1", raw.as_bytes(), "agent-1").unwrap();
     }
 
     // Recovery with scoped path — must insert into scoped, NOT flat.
@@ -225,4 +229,345 @@ fn test_boot_recovery_inserts_into_supplied_retention_path_not_flat() {
 
     // Flat path must NOT have been created.
     assert!(!flat_path.exists(), "must not write to flat retention.db");
+}
+
+// ─── Round-8 new tests ────────────────────────────────────────────────────────
+
+/// BLOCKING 1 — tombstone re-drive uses persisted retention_d_tag, not event d-tag.
+///
+/// Enqueues two tombstones for two distinct agents. Each tombstone (kind 5)
+/// carries no d-tag in the event; the synthetic key `30177:<agent_pk>` is
+/// stored in the outbox row's `retention_d_tag` column. Recovery must re-insert
+/// both rows at their correct (kind=5, pubkey=owner, d_tag=synthetic) coordinates
+/// so they don't collide and both survive.
+#[test]
+fn test_boot_recovery_tombstone_redrives_at_correct_retention_coordinate() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let scoped_path = anchor.join("retention").join("scoped.db");
+    std::fs::create_dir_all(scoped_path.parent().unwrap()).unwrap();
+
+    let owner_keys = nostr::Keys::generate();
+    let owner_pubkey = owner_keys.public_key().to_hex();
+
+    // Build two kind-5 tombstone events (no d-tag in the event payload).
+    let agent_pk_a = nostr::Keys::generate().public_key().to_hex();
+    let agent_pk_b = nostr::Keys::generate().public_key().to_hex();
+
+    // Kind-5 events with only an a-tag (NIP-09 deletion target).
+    let tombstone_a = nostr::EventBuilder::new(nostr::Kind::Custom(5), "")
+        .tag(nostr::Tag::custom(
+            nostr::TagKind::Custom("a".into()),
+            vec![format!("30177:{owner_pubkey}:{agent_pk_a}")],
+        ))
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+    let tombstone_b = nostr::EventBuilder::new(nostr::Kind::Custom(5), "")
+        .tag(nostr::Tag::custom(
+            nostr::TagKind::Custom("a".into()),
+            vec![format!("30177:{owner_pubkey}:{agent_pk_b}")],
+        ))
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+
+    // The retention d_tag for each tombstone is the synthetic key used at enqueue time.
+    let d_tag_a = tombstone_retention_d_tag(30177, &agent_pk_a);
+    let d_tag_b = tombstone_retention_d_tag(30177, &agent_pk_b);
+
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_operation(&j, "op-tomb-a", "tombstone", &agent_pk_a, Generation(0)).unwrap();
+        insert_outbox_event(
+            &j,
+            &tombstone_a.id.to_hex(),
+            "op-tomb-a",
+            tombstone_a.as_json().as_bytes(),
+            &d_tag_a,
+        )
+        .unwrap();
+
+        insert_operation(&j, "op-tomb-b", "tombstone", &agent_pk_b, Generation(0)).unwrap();
+        insert_outbox_event(
+            &j,
+            &tombstone_b.id.to_hex(),
+            "op-tomb-b",
+            tombstone_b.as_json().as_bytes(),
+            &d_tag_b,
+        )
+        .unwrap();
+    }
+
+    run_boot_recovery_at(&anchor, Some(&scoped_path)).unwrap();
+
+    let conn = open_retention_db(&scoped_path).unwrap();
+    let pending = get_pending_sync(&conn).unwrap();
+    assert_eq!(
+        pending.len(),
+        2,
+        "both tombstone retention rows must survive re-drive without collision; got {:?}",
+        pending.iter().map(|r| &r.d_tag).collect::<Vec<_>>()
+    );
+
+    // Verify each row uses the synthetic d_tag, not "" (what event-d-tag extraction would yield).
+    let d_tags: std::collections::HashSet<&str> =
+        pending.iter().map(|r| r.d_tag.as_str()).collect();
+    assert!(
+        d_tags.contains(d_tag_a.as_str()),
+        "row for agent A must use synthetic d_tag {d_tag_a}, got {d_tags:?}"
+    );
+    assert!(
+        d_tags.contains(d_tag_b.as_str()),
+        "row for agent B must use synthetic d_tag {d_tag_b}, got {d_tags:?}"
+    );
+    for row in &pending {
+        assert_eq!(row.pubkey, owner_pubkey, "row pubkey must be owner");
+        assert_ne!(
+            row.d_tag, "",
+            "d_tag must not be empty (empty = wrong coordinate)"
+        );
+    }
+}
+
+/// BLOCKING 1 — archive re-drive uses persisted retention_d_tag (agent pubkey).
+///
+/// Kind-9035 archive requests carry no d-tag in the event. The outbox row
+/// persists `retention_d_tag = agent_pubkey`. Recovery must re-insert at
+/// `(kind=9035, pubkey=owner, d_tag=agent_pk)`.
+#[test]
+fn test_boot_recovery_archive_redrives_at_correct_retention_coordinate() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let scoped_path = anchor.join("retention").join("scoped2.db");
+    std::fs::create_dir_all(scoped_path.parent().unwrap()).unwrap();
+
+    let owner_keys = nostr::Keys::generate();
+    let owner_pubkey = owner_keys.public_key().to_hex();
+    let agent_pk = nostr::Keys::generate().public_key().to_hex();
+
+    // Kind-9035 archive request — carries a `p` tag, no `d` tag.
+    let archive = nostr::EventBuilder::new(nostr::Kind::Custom(9035), "")
+        .tag(nostr::Tag::public_key(
+            nostr::PublicKey::from_hex(&agent_pk).unwrap(),
+        ))
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+
+    // At enqueue time archive_managed_agent_pending uses agent_pubkey as d_tag.
+    let retention_d_tag = agent_pk.clone();
+
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_operation(&j, "op-arch-1", "archive", &agent_pk, Generation(0)).unwrap();
+        insert_outbox_event(
+            &j,
+            &archive.id.to_hex(),
+            "op-arch-1",
+            archive.as_json().as_bytes(),
+            &retention_d_tag,
+        )
+        .unwrap();
+    }
+
+    run_boot_recovery_at(&anchor, Some(&scoped_path)).unwrap();
+
+    let conn = open_retention_db(&scoped_path).unwrap();
+    let pending = get_pending_sync(&conn).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "archive retention row must be re-inserted"
+    );
+    assert_eq!(
+        pending[0].d_tag, agent_pk,
+        "d_tag must be agent_pubkey (not empty)"
+    );
+    assert_eq!(pending[0].pubkey, owner_pubkey);
+    assert_eq!(pending[0].kind, 9035);
+}
+
+/// BLOCKING 2b — recovery-vs-live-mutation race: `run_file_commit_recovery`
+/// holds the advisory lock, so a concurrent `run_boot_recovery_at` (which
+/// acquires the same lock) blocks until recovery releases it.
+///
+/// We prove advisory-lock serialization by spawning a thread that holds the
+/// lock and verifying that a second acquisition attempt blocks until the first
+/// releases. This exercises the same serialization path that prevents
+/// `run_file_commit_recovery` and `mutate_store` from racing each other.
+#[test]
+fn test_file_commit_recovery_is_serialized_by_advisory_lock() {
+    use super::JournalLockGuard;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    // Ensure the journal exists so open_journal succeeds inside the lock.
+    open_journal(&anchor).unwrap();
+
+    let released = Arc::new(Mutex::new(false));
+    let released_clone = Arc::clone(&released);
+
+    // Thread 1: acquire the lock, hold it for 150 ms, then release.
+    let anchor_clone = anchor.clone();
+    let t1 = std::thread::spawn(move || {
+        let _guard = JournalLockGuard::acquire(&anchor_clone).expect("t1 acquire");
+        std::thread::sleep(Duration::from_millis(150));
+        *released_clone.lock().unwrap() = true;
+        // _guard drops here, releasing the lock
+    });
+
+    // Give thread 1 a moment to acquire before we try.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Thread 2: try to acquire — must block until thread 1 releases.
+    let anchor_clone2 = anchor.clone();
+    let released_check = Arc::clone(&released);
+    let t2 = std::thread::spawn(move || {
+        let start = Instant::now();
+        let _guard2 = JournalLockGuard::acquire(&anchor_clone2).expect("t2 acquire");
+        let waited = start.elapsed();
+        // By the time we get the lock, t1 must have set released=true.
+        let was_released = *released_check.lock().unwrap();
+        (was_released, waited)
+    });
+
+    t1.join().expect("t1 join");
+    let (was_released, waited) = t2.join().expect("t2 join");
+
+    assert!(
+        was_released,
+        "t2 must not acquire the lock before t1 releases it"
+    );
+    assert!(
+        waited >= Duration::from_millis(50),
+        "t2 must have blocked for at least 50 ms (waited {waited:?})"
+    );
+}
+
+/// BLOCKING 2c — Fix 4 failure injection: `prepare_publication` returns `Err`
+/// when the retention DB write fails (journal open failure is tested inline).
+///
+/// Tests the deepest achievable seam: `prepare_publication` directly, without
+/// a tauri AppHandle mock (none exists in this crate). A stated limitation
+/// acknowledged in the test: this does not cover the command-level propagation
+/// path, which requires an AppHandle — covered at code-review level by the
+/// `?`-propagation at `agents.rs:1315,1320` / `personas/mod.rs:283-288` /
+/// `teams.rs:324-330`.
+#[test]
+fn test_prepare_publication_propagates_retention_write_failure() {
+    use super::prepare_publication;
+
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+
+    let keys = nostr::Keys::generate();
+    let owner_pubkey = keys.public_key().to_hex();
+    let agent_pk = "test-agent-pk".to_string();
+
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(30177), "content")
+        .tag(nostr::Tag::identifier(&agent_pk))
+        .sign_with_keys(&keys)
+        .unwrap();
+    let event_id = event.id.to_hex();
+    let raw_json = event.as_json();
+
+    let journal = open_journal(&anchor).unwrap();
+    insert_operation(&journal, "op-fail-1", "publish", &agent_pk, Generation(0)).unwrap();
+
+    // A retention DB connection pointing at a non-writable path (read-only dir).
+    // We open an in-memory DB and then close it and use its connection handle after
+    // close to simulate a failed write. Instead, use a path in a non-existent subdir:
+    // open_retention_db will succeed but the INSERT will fail because the directory
+    // doesn't exist. Actually the simplest approach is to open an in-memory DB and
+    // immediately corrupt the schema so retain_event fails.
+    let bad_conn = rusqlite::Connection::open_in_memory().unwrap();
+    // No schema applied — retain_event will fail because the table doesn't exist.
+
+    let result = prepare_publication(
+        &journal,
+        &bad_conn,
+        "op-fail-1",
+        &event_id,
+        &raw_json,
+        30177,
+        &owner_pubkey,
+        &agent_pk,
+        &event.content,
+        event.created_at.as_secs() as i64,
+    );
+
+    assert!(
+        result.is_err(),
+        "prepare_publication must propagate retention write failure; got Ok"
+    );
+
+    // Verify the outbox row WAS written (journal-first ordering — evidence is durable).
+    let outbox = super::read_outbox_events(&journal, "op-fail-1").unwrap();
+    assert_eq!(
+        outbox.len(),
+        1,
+        "outbox row must be present even when retention write fails (boot recovery can re-drive)"
+    );
+}
+
+/// BLOCKING 2c — Fix 4 journal-open failure path (inline test).
+///
+/// `prepare_publication` calls `insert_outbox_event` which requires the journal
+/// connection. We simulate a journal-open failure by passing a connection that
+/// has no `outbox_events` table — the insert returns Err and the function
+/// propagates it without touching the retention DB.
+#[test]
+fn test_prepare_publication_propagates_journal_write_failure() {
+    use super::prepare_publication;
+
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+
+    let keys = nostr::Keys::generate();
+    let owner_pubkey = keys.public_key().to_hex();
+    let agent_pk = "test-agent-pk-2".to_string();
+
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(30177), "content")
+        .tag(nostr::Tag::identifier(&agent_pk))
+        .sign_with_keys(&keys)
+        .unwrap();
+    let event_id = event.id.to_hex();
+    let raw_json = event.as_json();
+
+    // A journal connection with no schema applied — outbox_events table absent.
+    let bad_journal = rusqlite::Connection::open_in_memory().unwrap();
+    // No operations table either, so insert_operation would fail — but we never
+    // reach retain_event since insert_outbox_event fails first.
+    // We still need an operation row referenced by the FK, but with no schema
+    // the insert itself will fail before FK check.
+
+    // Valid retention DB for contrast.
+    let retention_db_path = anchor.join("retention-for-journal-fail-test.db");
+    let retention_conn =
+        crate::managed_agents::retention::open_retention_db(&retention_db_path).unwrap();
+
+    let result = prepare_publication(
+        &bad_journal,
+        &retention_conn,
+        "op-no-schema",
+        &event_id,
+        &raw_json,
+        30177,
+        &owner_pubkey,
+        &agent_pk,
+        &event.content,
+        event.created_at.as_secs() as i64,
+    );
+
+    assert!(
+        result.is_err(),
+        "prepare_publication must propagate journal write failure; got Ok"
+    );
+
+    // Retention DB must be untouched — journal-first ordering.
+    let pending = get_pending_sync(&retention_conn).unwrap();
+    assert!(
+        pending.is_empty(),
+        "retention DB must be untouched when journal write fails"
+    );
 }

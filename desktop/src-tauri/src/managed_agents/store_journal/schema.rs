@@ -66,12 +66,18 @@ pub(super) fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
         -- flag).
         -- published_state: 0=pending, 1=published, 2=uncertain, 3=accepted.
         -- Advancing published_state is a fenced CAS; see mark_outbox_published.
+        -- retention_d_tag: the exact d_tag used in the retention coordinate at
+        -- enqueue time -- persisted so boot recovery can re-insert at the same
+        -- (kind, pubkey, d_tag) coordinate without re-deriving it from the
+        -- event payload, which may not carry a d-tag (e.g. kind-5 tombstones
+        -- use a synthetic key like 30177:<agent_pk>).
         CREATE TABLE IF NOT EXISTS outbox_events (
             event_id     TEXT NOT NULL PRIMARY KEY,
             operation_id TEXT NOT NULL
                 REFERENCES operations(operation_id),
             payload      BLOB NOT NULL,
             published_state INTEGER NOT NULL DEFAULT 0,
+            retention_d_tag TEXT NOT NULL DEFAULT '',
             created_at   INTEGER NOT NULL
         );
 
@@ -125,12 +131,19 @@ pub(super) fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
             "ALTER TABLE file_commit_phases ADD COLUMN agents_content_hash TEXT NOT NULL DEFAULT '';
              ALTER TABLE file_commit_phases ADD COLUMN teams_content_hash  TEXT NOT NULL DEFAULT '';",
         );
-        conn.pragma_update(None, "user_version", 3)
-            .map_err(|e| format!("bump schema user_version to 3: {e}"))?;
-    } else {
-        conn.pragma_update(None, "user_version", 3)
-            .map_err(|e| format!("set schema user_version: {e}"))?;
     }
+    // Schema version 4: add retention_d_tag column to outbox_events.
+    // Persists the exact retention coordinate (d_tag) used at enqueue time so
+    // boot recovery can re-insert at the same (kind, pubkey, d_tag) coordinate
+    // without re-parsing the event payload — necessary for kinds like 5 and
+    // 9035 that carry no d-tag in the event itself.
+    if current_version < 4 {
+        let _ = conn.execute_batch(
+            "ALTER TABLE outbox_events ADD COLUMN retention_d_tag TEXT NOT NULL DEFAULT '';",
+        );
+    }
+    conn.pragma_update(None, "user_version", 4)
+        .map_err(|e| format!("set schema user_version to 4: {e}"))?;
 
     Ok(())
 }

@@ -215,13 +215,13 @@ fn test_outbox_insert_is_idempotent() {
     let conn = in_memory_journal();
     insert_operation(&conn, "op-out", "create", "k1", Generation(0)).unwrap();
     let payload = b"hello";
-    let r1 = insert_outbox_event(&conn, "ev-1", "op-out", payload).unwrap();
+    let r1 = insert_outbox_event(&conn, "ev-1", "op-out", payload, "").unwrap();
     assert_eq!(
         r1,
         InsertEventOutcome::Inserted,
         "first insert must be Inserted"
     );
-    let r2 = insert_outbox_event(&conn, "ev-1", "op-out", payload).unwrap();
+    let r2 = insert_outbox_event(&conn, "ev-1", "op-out", payload, "").unwrap();
     assert_eq!(
         r2,
         InsertEventOutcome::ExactDuplicate,
@@ -236,8 +236,8 @@ fn test_outbox_insert_is_idempotent() {
 fn test_outbox_insert_identity_collision_fails_closed() {
     let conn = in_memory_journal();
     insert_operation(&conn, "op-out2", "create", "k1", Generation(0)).unwrap();
-    insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-a").unwrap();
-    let r = insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-b").unwrap();
+    insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-a", "").unwrap();
+    let r = insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-b", "").unwrap();
     assert_eq!(r, InsertEventOutcome::IdentityCollision);
 }
 
@@ -597,6 +597,7 @@ fn test_boot_recovery_leaves_pending_outbox_op_for_redriving() {
             "ev-pub-1",
             "op-outbox-1",
             b"{\"id\":\"ev-pub-1\"}",
+            "",
         )
         .unwrap();
     }
@@ -674,7 +675,14 @@ fn test_boot_recovery_journal_only_evidence_published_terminal_once() {
     {
         let journal = open_journal(&anchor).unwrap();
         insert_operation(&journal, "op-pub-1", "publish", "test-agent", Generation(0)).unwrap();
-        insert_outbox_event(&journal, &event_id, "op-pub-1", raw_payload.as_bytes()).unwrap();
+        insert_outbox_event(
+            &journal,
+            &event_id,
+            "op-pub-1",
+            raw_payload.as_bytes(),
+            "test-agent",
+        )
+        .unwrap();
     }
     let conn = open_retention_db(&retention_db_path).unwrap();
     assert!(

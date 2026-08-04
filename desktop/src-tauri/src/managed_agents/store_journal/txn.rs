@@ -714,7 +714,7 @@ fn recover_nonterminal_operations(
 
         // Determine publication state.
         let mut any_pending = false;
-        for (event_id, payload, published_state) in &outbox {
+        for (event_id, payload, published_state, retention_d_tag) in &outbox {
             if *published_state == 0 {
                 any_pending = true;
                 eprintln!(
@@ -722,16 +722,20 @@ fn recover_nonterminal_operations(
                     op.operation_id
                 );
                 // Ensure the retention DB has a `pending_sync` row for this
-                // event payload so the flush loop can publish it.  The payload
-                // is the immutable raw Nostr event JSON written at retain time.
-                // If the retention row is absent (crashed before it was written),
-                // insert it now so the flush loop picks it up.
+                // event payload so the flush loop can publish it.  The
+                // retention_d_tag is the exact coordinate persisted at enqueue
+                // time — used directly instead of re-parsing the event payload
+                // so tombstones and archives (kind 5 / 9035) recover at the
+                // correct (kind, pubkey, d_tag) coordinate.
                 //
                 // Best-effort: a retention failure here is logged; the outbox
                 // row remains pending for the next boot.
-                if let Err(e) =
-                    ensure_retention_row_for_payload(payload, event_id, retention_db_path)
-                {
+                if let Err(e) = ensure_retention_row_for_payload(
+                    payload,
+                    event_id,
+                    retention_d_tag,
+                    retention_db_path,
+                ) {
                     eprintln!(
                         "buzz-desktop: boot-recovery: could not ensure retention row for \
                          event {event_id}: {e}"
@@ -767,6 +771,12 @@ fn recover_nonterminal_operations(
 /// publish the event even when the retention row was never written (e.g. the
 /// process crashed between the journal COMMIT and the `retain_event` call).
 ///
+/// `retention_d_tag` is the exact d_tag persisted in the outbox row at
+/// enqueue time — it is used as the retention coordinate without any
+/// re-parsing of the event payload.  This is essential for kinds like 5 and
+/// 9035 that carry no d-tag in the event itself (tombstones use a synthetic
+/// key like `"30177:<agent_pk>"`; archives use the agent pubkey directly).
+///
 /// When `retention_db_path` is `Some`, parses the Nostr event and inserts a
 /// `pending_sync` row.  When `None` (first-boot before the retention DB
 /// exists, or test paths without AppHandle), logs a diagnostic and returns
@@ -775,6 +785,7 @@ fn recover_nonterminal_operations(
 fn ensure_retention_row_for_payload(
     payload: &[u8],
     event_id: &str,
+    retention_d_tag: &str,
     retention_db_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     use nostr::JsonUtil;
@@ -799,15 +810,6 @@ fn ensure_retention_row_for_payload(
     let conn = crate::managed_agents::retention::open_retention_db(db_path)
         .map_err(|e| format!("boot-recovery: open retention db: {e}"))?;
 
-    // Extract the d-tag from the event (required for the retention coordinate).
-    let d_tag = event
-        .tags
-        .iter()
-        .find(|t| t.kind() == nostr::TagKind::d())
-        .and_then(|t| t.content())
-        .unwrap_or("")
-        .to_string();
-
     let owner_pubkey = event.pubkey.to_hex();
 
     crate::managed_agents::retention::retain_event(
@@ -815,7 +817,7 @@ fn ensure_retention_row_for_payload(
         &crate::managed_agents::retention::RetainedEvent {
             kind: event.kind.as_u16() as u32,
             pubkey: owner_pubkey,
-            d_tag,
+            d_tag: retention_d_tag.to_string(),
             content: event.content.to_string(),
             created_at: event.created_at.as_secs() as i64,
             raw_event: event.as_json(),
@@ -826,7 +828,7 @@ fn ensure_retention_row_for_payload(
 
     eprintln!(
         "buzz-desktop: boot-recovery: re-inserted retention row for outbox event {event_id} \
-         (kind={})",
+         (kind={}, d_tag={retention_d_tag:?})",
         event.kind
     );
     Ok(())
@@ -872,7 +874,7 @@ pub fn prepare_publication(
 
     // Insert outbox evidence first — if this fails the closure Err rolls
     // back the whole transaction.
-    match insert_outbox_event(journal, event_id, operation_id, raw_json.as_bytes())? {
+    match insert_outbox_event(journal, event_id, operation_id, raw_json.as_bytes(), d_tag)? {
         InsertEventOutcome::Inserted | InsertEventOutcome::ExactDuplicate => {}
         InsertEventOutcome::IdentityCollision => {
             return Err(format!(
