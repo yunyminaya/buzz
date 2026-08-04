@@ -756,12 +756,73 @@ fn test_schema_migration_from_partial_v3_adds_missing_d_tag() {
     assert_eq!(ver, 4);
 }
 
-/// Fix B: if migration verification fails (column absent after ALTER TABLE due
-/// to a simulated failure), the version must NOT have been advanced to 4.
-/// We simulate this by using a read-only connection that rejects schema changes.
-/// Since SQLite in-memory DBs can't be made read-only, we verify the property
-/// by opening a fresh v2 DB, running migration, then confirming re-running on
-/// an already-at-4 DB is idempotent (no error, version stays 4).
+/// Fix B: a migration failure (ALTER TABLE rejected) must NOT advance
+/// `user_version`. The function returns `Err`, and the DB remains at v2 so
+/// the next open retries the migration in full.
+///
+/// We simulate a write-blocking failure by setting `PRAGMA query_only = ON`
+/// on the in-memory connection before calling `apply_journal_schema_pub`.
+/// SQLite rejects `ALTER TABLE` (a write) with `attempt to write a readonly
+/// database`, but `CREATE TABLE IF NOT EXISTS` no-ops are read operations on
+/// tables that already exist, so the base-schema batch passes through. The
+/// `ADD COLUMN` call inside the migration transaction fails, the transaction
+/// rolls back, and `user_version` stays at 2.
+///
+/// The second half of the test disables `query_only`, calls again, and asserts
+/// that the migration succeeds and reaches v4 — proving the retry path works.
+#[test]
+fn test_schema_migration_failure_does_not_advance_version() {
+    let conn = v2_journal();
+
+    // Block writes: ALTER TABLE will fail; version stamp will not land.
+    conn.pragma_update(None, "query_only", 1i32).unwrap();
+    let result = apply_journal_schema_pub(&conn);
+    assert!(
+        result.is_err(),
+        "migration must return Err when ALTER TABLE is blocked"
+    );
+
+    // Version must still be 2 — transaction rolled back before the stamp.
+    let ver: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        ver, 2,
+        "user_version must remain 2 after a failed migration"
+    );
+
+    // Re-enable writes: the next call retries and must succeed.
+    conn.pragma_update(None, "query_only", 0i32).unwrap();
+    apply_journal_schema_pub(&conn).unwrap();
+
+    // All three columns must be present and version must reach 4.
+    let fcp_cols: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(file_commit_phases)")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(fcp_cols.contains(&"agents_content_hash".to_string()));
+    assert!(fcp_cols.contains(&"teams_content_hash".to_string()));
+    let oe_cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(outbox_events)").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(oe_cols.contains(&"retention_d_tag".to_string()));
+    let ver2: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver2, 4, "user_version must reach 4 after successful retry");
+}
+
+/// Fix B: re-running `apply_journal_schema_pub` on a fully-migrated v4 DB is
+/// a no-op — version stays at 4 and the call succeeds without errors.
 #[test]
 fn test_schema_migration_idempotent_on_v4() {
     let conn = v2_journal();
