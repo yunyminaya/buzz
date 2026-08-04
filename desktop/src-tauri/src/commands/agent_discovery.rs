@@ -519,9 +519,9 @@ async fn restart_single_agent_after_install(
         app_state::AppState,
         managed_agents::{
             agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-            load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-            resolve_effective_agent_env, save_managed_agents, stop_managed_agent_process,
-            sync_managed_agent_processes, AgentReadiness, BackendKind,
+            load_global_agent_config, load_personas, mutate_agent_store, record_agent_command,
+            resolve_effective_agent_env, stop_managed_agent_process, sync_managed_agent_processes,
+            AgentReadiness, BackendKind,
         },
     };
     use tauri::Manager;
@@ -533,81 +533,77 @@ async fn restart_single_agent_after_install(
     let stop_result = tokio::task::spawn_blocking(move || {
         let state = app_for_stop.state::<AppState>();
 
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| format!("failed to acquire store lock: {e}"))?;
 
-        let mut records = load_managed_agents(&app_for_stop)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| format!("failed to acquire runtimes lock: {e}"))?;
 
-        // Sync process state so PID liveness reflects current reality.
-        let (sync_changed, _) = sync_managed_agent_processes(
-            &mut records,
-            &mut runtimes,
-            &current_instance_id(&app_for_stop),
-        );
-        if sync_changed {
-            save_managed_agents(&app_for_stop, &records)?;
-        }
+        let app_for_closure = app_for_stop.clone();
+        let (runtime_keys, _guard) = mutate_agent_store(
+            &app_for_stop,
+            store_guard,
+            move |mut records, _journal| {
+                let instance_id = current_instance_id(&app_for_closure);
+                // Sync process state so PID liveness reflects current reality.
+                sync_managed_agent_processes(&mut records, &mut runtimes, &instance_id);
 
-        // Re-verify eligibility under lock.
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == pubkey_owned)
-            .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
+                // Re-verify eligibility under lock.
+                let record = records
+                    .iter()
+                    .find(|r| r.pubkey == pubkey_owned)
+                    .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
 
-        if record.backend != BackendKind::Local {
-            return Err(format!("agent {pubkey_owned} is no longer a local agent"));
-        }
-        let runtime_keys =
-            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
-        if runtime_keys.is_empty() {
-            return Err(format!(
-                "agent {pubkey_owned} no longer has a live pair runtime after sync"
-            ));
-        }
+                if record.backend != BackendKind::Local {
+                    return Err(format!("agent {pubkey_owned} is no longer a local agent"));
+                }
+                let runtime_keys =
+                    crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
+                if runtime_keys.is_empty() {
+                    return Err(format!("agent {pubkey_owned} no longer has a live pair runtime after sync"));
+                }
 
-        let personas = load_personas(&app_for_stop).unwrap_or_default();
-        let global = load_global_agent_config(&app_for_stop).unwrap_or_default();
+                let personas = load_personas(&app_for_closure).unwrap_or_default();
+                let global = load_global_agent_config(&app_for_closure).unwrap_or_default();
 
-        let effective_cmd = record_agent_command(record, &personas);
-        let runtime_matches =
-            known_acp_runtime(&effective_cmd).is_some_and(|r| r.id == runtime_id_owned);
-        if !runtime_matches {
-            return Err(format!(
-                "agent {pubkey_owned} runtime no longer matches {runtime_id_owned} under lock"
-            ));
-        }
+                let effective_cmd = record_agent_command(record, &personas);
+                let runtime_matches =
+                    known_acp_runtime(&effective_cmd).is_some_and(|r| r.id == runtime_id_owned);
+                if !runtime_matches {
+                    return Err(format!(
+                        "agent {pubkey_owned} runtime no longer matches {runtime_id_owned} under lock"
+                    ));
+                }
 
-        let setup_mode = runtimes
-            .iter()
-            .find(|(key, _)| key.pubkey == pubkey_owned)
-            .map(|(_, p)| p.setup_mode)
-            .unwrap_or(false);
-        if !setup_mode {
-            return Err(format!(
-                "agent {pubkey_owned} is not in setup mode under lock — skipping"
-            ));
-        }
+                let setup_mode = runtimes
+                    .iter()
+                    .find(|(key, _)| key.pubkey == pubkey_owned)
+                    .map(|(_, p)| p.setup_mode)
+                    .unwrap_or(false);
+                if !setup_mode {
+                    return Err(format!("agent {pubkey_owned} is not in setup mode under lock — skipping"));
+                }
 
-        let runtime_meta = known_acp_runtime(&effective_cmd);
-        let effective = resolve_effective_agent_env(record, &personas, runtime_meta, &global);
-        if !matches!(agent_readiness(&effective), AgentReadiness::Ready) {
-            return Err(format!(
-                "agent {pubkey_owned} readiness is still NotReady after install — not bouncing"
-            ));
-        }
+                let runtime_meta = known_acp_runtime(&effective_cmd);
+                let effective = resolve_effective_agent_env(record, &personas, runtime_meta, &global);
+                if !matches!(agent_readiness(&effective), AgentReadiness::Ready) {
+                    return Err(format!(
+                        "agent {pubkey_owned} readiness is still NotReady after install — not bouncing"
+                    ));
+                }
 
-        // Stop the process.
-        let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
-        stop_managed_agent_process(&app_for_stop, record_mut, &mut runtimes)?;
-        save_managed_agents(&app_for_stop, &records)?;
+                // Stop the process — mutation happens under the advisory lock.
+                let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
+                stop_managed_agent_process(&app_for_closure, record_mut, &mut runtimes)?;
 
-        Ok(runtime_keys)
+                Ok((records, runtime_keys))
+            },
+        )?;
+        Ok::<Vec<crate::managed_agents::ManagedAgentRuntimeKey>, String>(runtime_keys)
     })
     .await;
 
@@ -659,19 +655,23 @@ fn persist_last_error_on_install(
 ) -> Result<(), String> {
     use crate::{
         app_state::AppState,
-        managed_agents::{find_managed_agent_mut, load_managed_agents, save_managed_agents},
+        managed_agents::{find_managed_agent_mut, mutate_agent_store},
     };
     use tauri::Manager;
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire store lock: {e}"))?;
-    let mut records = load_managed_agents(app)?;
-    let record = find_managed_agent_mut(&mut records, pubkey)?;
-    record.last_error = Some(error.to_string());
-    record.updated_at = crate::util::now_iso();
-    save_managed_agents(app, &records)
+    let pubkey = pubkey.to_owned();
+    let error = error.to_owned();
+    mutate_agent_store(app, store_guard, move |mut instances, _journal| {
+        let record = find_managed_agent_mut(&mut instances, &pubkey)?;
+        record.last_error = Some(error);
+        record.updated_at = crate::util::now_iso();
+        Ok((instances, ()))
+    })
+    .map(|_| ())
 }
 
 /// Build the `-l -c` argument list for the install shell.

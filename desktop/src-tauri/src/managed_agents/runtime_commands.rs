@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::{
     agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
     load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
+    mutate_agent_store, process_is_running, record_agent_command, resolve_effective_agent_env,
     spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
     write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
     ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
@@ -146,76 +146,82 @@ pub fn list_managed_agent_runtimes(
     // the locks, instead of hitting disk per row while holding them.
     let personas = load_personas(&app).unwrap_or_default();
     let global = load_global_agent_config(&app).unwrap_or_default();
-    let state = app.state::<AppState>();
+    let app_for_state = app.clone();
+    let state = app_for_state.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
-    let exited_keys: Vec<_> = runtimes
-        .iter_mut()
-        .filter_map(|(key, runtime)| match runtime.child.try_wait() {
-            Ok(Some(_)) | Err(_) => Some(key.clone()),
-            Ok(None) => None,
-        })
-        .collect();
-    let records_changed = !exited_keys.is_empty();
-    let mut statuses = Vec::new();
-    for key in exited_keys {
-        runtimes.remove(&key);
-        super::remove_agent_runtime_receipt(&app, &key);
-        state.clear_agent_session_cache(&key);
-        if let Some(record) = records
-            .iter_mut()
-            .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
-        {
-            record.updated_at = crate::util::now_iso();
-            record.last_stopped_at = Some(record.updated_at.clone());
-            let status = status_for_with(
-                &app,
-                record,
-                &key,
-                None,
-                None,
-                StatusInputs {
-                    personas: &personas,
-                    global: &global,
-                },
-            );
-            emit_status(&app, &status);
-            statuses.push(status);
-        }
-    }
-    statuses.extend(runtimes.iter().filter_map(|(key, runtime)| {
-        let record = records
-            .iter()
-            .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))?;
-        Some(status_for_with(
-            &app,
-            record,
-            key,
-            Some(runtime),
-            None,
-            StatusInputs {
-                personas: &personas,
-                global: &global,
-            },
-        ))
-    }));
-    drop(runtimes);
-    // Records are only mutated above when a runtime exited — skip the store
-    // rewrite on the common nothing-changed poll.
-    if records_changed {
-        save_managed_agents(&app, &records)?;
-    }
+    let instance_id = current_instance_id(&app);
+
+    let app_for_closure = app.clone();
+    let (statuses, _guard) =
+        mutate_agent_store(&app, store_guard, move |mut records, _journal| {
+            let exited_keys: Vec<_> = runtimes
+                .iter_mut()
+                .filter_map(|(key, runtime)| match runtime.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => Some(key.clone()),
+                    Ok(None) => None,
+                })
+                .collect();
+            let records_changed = !exited_keys.is_empty();
+            let mut statuses = Vec::new();
+            for key in exited_keys {
+                runtimes.remove(&key);
+                super::remove_agent_runtime_receipt(&app_for_closure, &key);
+                app_for_closure
+                    .state::<AppState>()
+                    .clear_agent_session_cache(&key);
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
+                {
+                    record.updated_at = crate::util::now_iso();
+                    record.last_stopped_at = Some(record.updated_at.clone());
+                    let status = status_for_with(
+                        &app_for_closure,
+                        record,
+                        &key,
+                        None,
+                        None,
+                        StatusInputs {
+                            personas: &personas,
+                            global: &global,
+                        },
+                    );
+                    emit_status(&app_for_closure, &status);
+                    statuses.push(status);
+                }
+            }
+            statuses.extend(runtimes.iter().filter_map(|(key, runtime)| {
+                let record = records
+                    .iter()
+                    .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))?;
+                Some(status_for_with(
+                    &app_for_closure,
+                    record,
+                    key,
+                    Some(runtime),
+                    None,
+                    StatusInputs {
+                        personas: &personas,
+                        global: &global,
+                    },
+                ))
+            }));
+
+            // Only write back when records actually changed; always return records.
+            let _ = (records_changed, instance_id);
+            Ok((records, statuses))
+        })?;
     Ok(statuses)
 }
 
@@ -243,7 +249,8 @@ fn start_pair(
     expected_updated_at: Option<&str>,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    let state = app.state::<AppState>();
+    let app_for_state = app.clone();
+    let state = app_for_state.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
@@ -251,60 +258,71 @@ fn start_pair(
     if state.shutdown_started.load(Ordering::Acquire) {
         return Err("desktop shutdown has started".into());
     }
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
-    let record = find_managed_agent_mut(&mut records, &pubkey)?;
-    if record.backend != BackendKind::Local {
-        return Err("managed runtime pairs require a local agent".into());
-    }
-    if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
-        return Err("managed agent changed while runtime reconciliation was in flight".into());
-    }
-    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
-    if runtimes
-        .get_mut(&key)
-        .is_some_and(|runtime| runtime.child.try_wait().ok().flatten().is_none())
-    {
-        let status = status_for(&app, record, &key, runtimes.get(&key), None);
-        return Ok(status);
-    }
-    runtimes.remove(&key);
-    terminate_untracked_pair_runtime(&app, &key)?;
-
     let owner = state
         .keys
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
-    let now = crate::util::now_iso();
-    let receipt = ManagedAgentRuntimeReceipt {
-        key: key.clone(),
-        pid: process.child.id(),
-        desktop_instance_id: current_instance_id(&app),
-        started_at: now.clone(),
-    };
-    if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
-        let _ = terminate_process(process.child.id());
-        let _ = process.child.wait();
-        return Err(error);
-    }
-    record.runtime_pid = None;
-    record.updated_at = now.clone();
-    record.last_started_at = Some(now);
-    record.last_stopped_at = None;
-    record.last_error = None;
-    runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
-    let status = status_for(&app, record, &key, runtimes.get(&key), None);
-    drop(runtimes);
-    save_managed_agents(&app, &records)?;
+
+    let app_for_closure = app.clone();
+    let (status, _store_guard) =
+        mutate_agent_store(&app, store_guard, move |mut records, _journal| {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            if record.backend != BackendKind::Local {
+                return Err("managed runtime pairs require a local agent".into());
+            }
+            if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
+                return Err(
+                    "managed agent changed while runtime reconciliation was in flight".into(),
+                );
+            }
+            let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+            if runtimes
+                .get_mut(&key)
+                .is_some_and(|runtime| runtime.child.try_wait().ok().flatten().is_none())
+            {
+                let status = status_for(&app_for_closure, record, &key, runtimes.get(&key), None);
+                return Ok((records, status));
+            }
+            runtimes.remove(&key);
+            terminate_untracked_pair_runtime(&app_for_closure, &key)?;
+
+            let mut process = spawn_agent_child(
+                &app_for_closure,
+                record,
+                &key.relay_url,
+                lazy,
+                owner.as_deref(),
+            )?;
+            let now = crate::util::now_iso();
+            let receipt = ManagedAgentRuntimeReceipt {
+                key: key.clone(),
+                pid: process.child.id(),
+                desktop_instance_id: current_instance_id(&app_for_closure),
+                started_at: now.clone(),
+            };
+            if let Err(error) = write_agent_runtime_receipt(&app_for_closure, &receipt) {
+                let _ = terminate_process(process.child.id());
+                let _ = process.child.wait();
+                return Err(error);
+            }
+            record.runtime_pid = None;
+            record.updated_at = now.clone();
+            record.last_started_at = Some(now);
+            record.last_stopped_at = None;
+            record.last_error = None;
+            runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+            let status = status_for(&app_for_closure, record, &key, runtimes.get(&key), None);
+            Ok((records, status))
+        })?;
     emit_status(&app, &status);
     Ok(status)
 }
@@ -315,63 +333,60 @@ pub fn stop_managed_agent_runtime(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    let state = app.state::<AppState>();
+    let app_for_state = app.clone();
+    let state = app_for_state.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
-    let _store = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
-    let record = find_managed_agent_mut(&mut records, &pubkey)?;
-    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
-    if let Some(mut runtime) = runtimes.remove(&key) {
-        let stop_result = if process_is_running(runtime.child.id()) {
-            terminate_process(runtime.child.id())
-        } else {
-            Ok(())
-        }
-        .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
-        match stop_result {
-            Ok(status) => {
-                record.last_exit_code = status.code();
-                let _ = append_log_marker(&runtime.log_path, "=== stopped pair runtime ===");
+
+    let app_for_closure = app.clone();
+    let (status, _store_guard) =
+        mutate_agent_store(&app, store_guard, move |mut records, _journal| {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+            if let Some(mut runtime) = runtimes.remove(&key) {
+                let stop_result = if process_is_running(runtime.child.id()) {
+                    terminate_process(runtime.child.id())
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
+                match stop_result {
+                    Ok(status) => {
+                        record.last_exit_code = status.code();
+                        let _ =
+                            append_log_marker(&runtime.log_path, "=== stopped pair runtime ===");
+                    }
+                    Err(error) => {
+                        // Keep failed teardown visible/manageable instead of orphaning it.
+                        runtimes.insert(key, runtime);
+                        return Err(error);
+                    }
+                }
+            } else {
+                // No runtime is tracked at this key, but a valid prior-session
+                // receipt may still point at a live child.
+                terminate_untracked_pair_runtime(&app_for_closure, &key)?;
             }
-            Err(error) => {
-                // Keep failed teardown visible/manageable instead of
-                // orphaning it: the child stays tracked and the receipt
-                // stays on disk until a stop actually succeeds.
-                runtimes.insert(key, runtime);
-                return Err(error);
-            }
-        }
-    } else {
-        // No runtime is tracked at this key, but a valid prior-session
-        // receipt may still point at a live child (e.g. the crash-recovery
-        // window for a non-auto-start agent). Terminate that orphan before
-        // erasing its receipt — otherwise this "stop" leaves the harness
-        // running yet deletes the one artifact sweeps and
-        // terminate_untracked_pair_runtime use to find it, and a follow-up
-        // start would spawn a duplicate harness for the same pair. On
-        // failure the receipt stays on disk (terminate_untracked_pair_runtime
-        // only removes it after the child exits), mirroring the tracked
-        // path's keep-until-success invariant.
-        terminate_untracked_pair_runtime(&app, &key)?;
-    }
-    super::remove_agent_runtime_receipt(&app, &key);
-    state.clear_agent_session_cache(&key);
-    record.runtime_pid = None;
-    record.updated_at = crate::util::now_iso();
-    record.last_stopped_at = Some(record.updated_at.clone());
-    let status = status_for(&app, record, &key, None, None);
-    drop(runtimes);
-    save_managed_agents(&app, &records)?;
+            super::remove_agent_runtime_receipt(&app_for_closure, &key);
+            app_for_closure
+                .state::<AppState>()
+                .clear_agent_session_cache(&key);
+            record.runtime_pid = None;
+            record.updated_at = crate::util::now_iso();
+            record.last_stopped_at = Some(record.updated_at.clone());
+            let status = status_for(&app_for_closure, record, &key, None, None);
+            Ok((records, status))
+        })?;
     emit_status(&app, &status);
     Ok(status)
 }

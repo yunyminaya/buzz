@@ -4,9 +4,8 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, current_instance_id, find_managed_agent_mut,
-        load_managed_agents, load_personas, save_managed_agents, sync_managed_agent_processes,
-        ManagedAgentSummary,
+        build_managed_agent_summary, current_instance_id, load_personas, mutate_agent_store,
+        sync_managed_agent_processes, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -26,44 +25,75 @@ pub async fn set_managed_agent_start_on_app_launch(
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|error| error.to_string())?;
-
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
-
-        {
-            let record = find_managed_agent_mut(&mut records, &pubkey)?;
-            record.start_on_app_launch = start_on_app_launch;
-            record.updated_at = now_iso();
-        }
-
-        save_managed_agents(&app, &records)?;
-        let record = records
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let instance_id = current_instance_id(&app);
         let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        let global_config =
+            crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+
+        let app_for_closure = app.clone();
+        let pubkey_for_closure = pubkey.clone();
+        let ((summary, exited_pubkeys), _guard) =
+            mutate_agent_store(&app, store_guard, move |mut instances, journal| {
+                let (_, exited) =
+                    sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
+                let record = instances
+                    .iter_mut()
+                    .find(|r| r.pubkey == pubkey)
+                    .ok_or_else(|| format!("agent {pubkey} not found"))?;
+                // Journal: record update + CAS generation for this agent key.
+                let op_id = crate::managed_agents::store_journal::new_operation_id();
+                let (current_gen, _) = crate::managed_agents::store_journal::read_generation(
+                    journal,
+                    &pubkey_for_closure,
+                )?;
+                crate::managed_agents::store_journal::insert_operation(
+                    journal,
+                    &op_id,
+                    "update",
+                    &pubkey_for_closure,
+                    current_gen,
+                )?;
+                match crate::managed_agents::store_journal::cas_generation(
+                    journal,
+                    &pubkey_for_closure,
+                    current_gen,
+                )? {
+                    crate::managed_agents::store_journal::CasOutcome::Committed { .. } => {}
+                    crate::managed_agents::store_journal::CasOutcome::Tombstoned { .. } => {
+                        return Err(format!(
+                            "agent {pubkey_for_closure}: tombstoned — cannot update settings"
+                        ));
+                    }
+                    crate::managed_agents::store_journal::CasOutcome::Conflict { current } => {
+                        return Err(format!(
+                            "agent {pubkey_for_closure}: generation conflict (expected {}, current {})",
+                            current_gen.0, current.0
+                        ));
+                    }
+                }
+                record.start_on_app_launch = start_on_app_launch;
+                record.updated_at = now_iso();
+                let summary = build_managed_agent_summary(
+                    &app_for_closure,
+                    record,
+                    &runtimes,
+                    &personas,
+                    &global_config,
+                )?;
+                Ok((instances, (summary, exited)))
+            })?;
+        for pk in &exited_pubkeys {
+            state.clear_agent_session_caches(pk);
+        }
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -77,44 +107,75 @@ pub async fn set_managed_agent_auto_restart(
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|error| error.to_string())?;
-
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
-
-        {
-            let record = find_managed_agent_mut(&mut records, &pubkey)?;
-            record.auto_restart_on_config_change = auto_restart_on_config_change;
-            record.updated_at = now_iso();
-        }
-
-        save_managed_agents(&app, &records)?;
-        let record = records
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let instance_id = current_instance_id(&app);
         let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        let global_config =
+            crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+
+        let app_for_closure = app.clone();
+        let pubkey_for_closure2 = pubkey.clone();
+        let ((summary, exited_pubkeys), _guard) =
+            mutate_agent_store(&app, store_guard, move |mut instances, journal| {
+                let (_, exited) =
+                    sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
+                let record = instances
+                    .iter_mut()
+                    .find(|r| r.pubkey == pubkey)
+                    .ok_or_else(|| format!("agent {pubkey} not found"))?;
+                // Journal: record update + CAS generation for this agent key.
+                let op_id = crate::managed_agents::store_journal::new_operation_id();
+                let (current_gen, _) = crate::managed_agents::store_journal::read_generation(
+                    journal,
+                    &pubkey_for_closure2,
+                )?;
+                crate::managed_agents::store_journal::insert_operation(
+                    journal,
+                    &op_id,
+                    "update",
+                    &pubkey_for_closure2,
+                    current_gen,
+                )?;
+                match crate::managed_agents::store_journal::cas_generation(
+                    journal,
+                    &pubkey_for_closure2,
+                    current_gen,
+                )? {
+                    crate::managed_agents::store_journal::CasOutcome::Committed { .. } => {}
+                    crate::managed_agents::store_journal::CasOutcome::Tombstoned { .. } => {
+                        return Err(format!(
+                            "agent {pubkey_for_closure2}: tombstoned — cannot update settings"
+                        ));
+                    }
+                    crate::managed_agents::store_journal::CasOutcome::Conflict { current } => {
+                        return Err(format!(
+                            "agent {pubkey_for_closure2}: generation conflict (expected {}, current {})",
+                            current_gen.0, current.0
+                        ));
+                    }
+                }
+                record.auto_restart_on_config_change = auto_restart_on_config_change;
+                record.updated_at = now_iso();
+                let summary = build_managed_agent_summary(
+                    &app_for_closure,
+                    record,
+                    &runtimes,
+                    &personas,
+                    &global_config,
+                )?;
+                Ok((instances, (summary, exited)))
+            })?;
+        for pk in &exited_pubkeys {
+            state.clear_agent_session_caches(pk);
+        }
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

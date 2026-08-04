@@ -4,6 +4,10 @@ use nostr::Keys;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
+use crate::managed_agents::store_journal::{
+    cas_generation, insert_operation, new_operation_id, read_generation, CasOutcome,
+};
+
 use super::agent_model_process::run_agent_models_command;
 // The map-only lookup is reached solely from the base-URL helpers that exist for
 // their unit tests; discovery itself always goes through the process-env variant.
@@ -18,14 +22,12 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         build_managed_agent_summary, current_instance_id, discovery_env_with_baked_floor,
-        find_managed_agent_mut, known_acp_runtime, load_global_agent_config, load_managed_agents,
-        load_personas, managed_agent_avatar_url, missing_command_message, normalize_agent_args,
-        resolve_command, save_managed_agents, sync_managed_agent_processes, try_regenerate_nest,
-        AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
-        DEFAULT_ACP_COMMAND,
+        known_acp_runtime, load_global_agent_config, load_personas, managed_agent_avatar_url,
+        missing_command_message, normalize_agent_args, resolve_command,
+        sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo, AgentModelsResponse,
+        UpdateManagedAgentRequest, UpdateManagedAgentResponse, DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
-    util::now_iso,
 };
 
 /// Query available models from an agent via `buzz-acp models --json`.
@@ -39,22 +41,28 @@ pub async fn get_agent_models(
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
     let (resolved_acp, agent_command, discovery) = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
+        let instance_id = current_instance_id(&app);
+
+        let ((records, exited_pubkeys), _guard) = crate::managed_agents::mutate_agent_store(
+            &app,
+            store_guard,
+            move |mut instances, _journal| {
+                let (_, exited) =
+                    sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
+                let out = instances.clone();
+                Ok((instances, (out, exited)))
+            },
+        )?;
+        for pk in &exited_pubkeys {
+            state.clear_agent_session_caches(pk);
         }
 
         let record = records
@@ -65,16 +73,8 @@ pub async fn get_agent_models(
         let resolved = resolve_command(&record.acp_command)
             .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
 
-        // Resolve the effective harness from the linked persona (mirrors spawn),
-        // so model discovery runs against the persona's current harness, not the
-        // frozen record snapshot. An explicit per-agent override wins.
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
-
-        // Single pure helper — descriptor + authoritative model/provider
-        // resolver, packaged so the linked-agent regression test binds the
-        // exact values this command consumes. Returns Err on dangling harness
-        // id, propagating it to the caller.
         let discovery = agent_model_discovery_config(record, &personas, &global)
             .map_err(|e| model_discovery_error(&pubkey, &e))?;
 
@@ -95,8 +95,6 @@ pub async fn get_agent_models(
     } = discovery;
 
     let merged_env = discovery_env_with_baked_floor(merged_env);
-    // Resolve against the baked/process env when the record saved no provider,
-    // so a build-provided provider still gets live discovery.
     let effective_provider =
         effective_discovery_provider(saved_provider.as_deref(), provider_env_var, &merged_env);
     if let Some(models) = discover_openrouter_models(
@@ -154,10 +152,6 @@ pub async fn get_agent_models(
 }
 
 /// Error copy for a failed harness resolution during model discovery.
-///
-/// Routes through `user_facing_harness_error` so a dangling harness id renders
-/// as a sentence, never as the raw `DANGLING_HARNESS_ID:` sentinel — the same
-/// contract spawn and summary rows honor.
 fn model_discovery_error(pubkey: &str, error: &str) -> String {
     format!(
         "cannot discover models for {pubkey}: {}",
@@ -229,8 +223,7 @@ pub async fn discover_agent_models(
         &input.env_vars,
     );
     let merged_env = discovery_env_with_baked_floor(merged_env);
-    // Recover a build-provided provider when the form has none, so the create
-    // dialog discovers live models instead of falling through to the subprocess.
+    // Recover a build-provided provider when the form has none.
     let effective_provider = effective_discovery_provider(
         input.provider.as_deref(),
         runtime_meta.and_then(|meta| meta.provider_env_var),
@@ -773,15 +766,8 @@ async fn discover_databricks_models(
     }))
 }
 
-/// Apply an `UpdateManagedAgentRequest`'s model/provider/system_prompt patch
-/// to `record`, enforcing the linked-instance write guard: a definition-linked
-/// record's model/provider/prompt are definition-authoritative (see
-/// `effective_config::resolve_linked`), so writes to these three fields are
-/// silently dropped for a linked instance rather than persisting a byte the
-/// resolver will never read. Definition-less instances accept the patch
-/// as-is. Extracted so the guard is exercised by both `update_managed_agent`
-/// and its regression tests — a test that reimplements this check instead of
-/// calling it can go green after the real guard is deleted.
+/// Apply model/provider/system_prompt updates to `record`.
+/// Silently drops writes for definition-linked records (definition-authoritative fields).
 fn apply_model_provider_prompt_update(
     record: &mut crate::managed_agents::ManagedAgentRecord,
     model: Option<Option<String>>,
@@ -803,9 +789,7 @@ fn apply_model_provider_prompt_update(
 }
 
 /// Update mutable fields on an existing managed agent record.
-///
-/// Does NOT auto-restart the agent. Runtime config changes (system prompt,
-/// parallelism, commands, toolsets) take effect on the next agent spawn.
+/// Runtime config changes take effect on the next agent spawn.
 /// Name changes are synced to the relay immediately via a kind:0 re-publish.
 #[tauri::command]
 pub async fn update_managed_agent(
@@ -813,156 +797,171 @@ pub async fn update_managed_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
-    // Phase 1: local save (synchronous, under lock)
-    let (summary, sync_params, rollback) = {
-        let _store_guard = state
+    // Validate allowlist constraints before the mutation closure (borrow must precede move).
+    let prospective_allowlist_opt = match input.respond_to_allowlist.as_ref() {
+        Some(list) => Some(crate::managed_agents::validate_respond_to_allowlist(list)?),
+        None => None,
+    };
+    let prospective_mode_opt = input.respond_to;
+
+    let (summary, sync_params, rollback, _op_id) = {
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
-        let (_, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
+        let instance_id = current_instance_id(&app);
+        let pubkey_str = input.pubkey.clone();
+        let op_id = new_operation_id();
+        let op_id_for_closure = op_id.clone();
+        let personas_for_closure = load_personas(&app).unwrap_or_default();
 
-        let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
-        let previous_record = record.clone();
+        let ((record_out, (name_changed, previous_record, exited_pubkeys)), _guard) =
+            crate::managed_agents::mutate_agent_store(
+                &app,
+                store_guard,
+                move |mut instances, journal| {
+                    let (_, exited) =
+                        sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
+                    let record = instances
+                        .iter_mut()
+                        .find(|r| r.pubkey == pubkey_str)
+                        .ok_or_else(|| format!("agent {pubkey_str} not found"))?;
+                    let previous_record = record.clone();
+                    let mut name_changed = false;
 
-        let mut name_changed = false;
-        if let Some(name_update) = input.name {
-            let trimmed = name_update.trim().to_string();
-            if !trimmed.is_empty() && trimmed != record.name {
-                record.name = trimmed;
-                name_changed = true;
-            }
-        }
-        apply_model_provider_prompt_update(
-            record,
-            input.model,
-            input.provider,
-            input.system_prompt,
-        );
-        if let Some(parallelism) = input.parallelism {
-            record.parallelism = parallelism;
-        }
-        // turn_timeout_seconds is intentionally not applied here —
-        // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
-        // Use idle_timeout_seconds or max_turn_duration_seconds instead.
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty falls back to the workspace relay at
-        // read-time. A name-only edit (relay_url == None) leaves the pin intact.
-        if let Some(relay_url) = input.relay_url {
-            record.relay_url = relay_url.trim().to_string();
-        }
-        if let Some(acp_command) = input.acp_command {
-            record.acp_command = acp_command;
-        }
-        // Harness edit: the persona's runtime is authoritative, so an explicit
-        // `agent_command_override` is persisted ONLY when the user picks a
-        // command that diverges from the persona, and the empty/whitespace
-        // "Inherit from persona" sentinel clears both the pin and the
-        // materialized record runtime. A name-only edit
-        // (`agent_command == None`) leaves the pin intact. `harness_override`
-        // threads the user's explicit intent — see `apply_agent_command_update`
-        // and `update_time_agent_command_override` for the full resolution
-        // rules.
-        if let Some(agent_command) = input.agent_command {
-            let personas = load_personas(&app).unwrap_or_default();
-            crate::managed_agents::apply_agent_command_update(
-                record,
-                &personas,
-                &agent_command,
-                input.harness_override,
-            );
-        }
-        if let Some(agent_args) = input.agent_args {
-            record.agent_args = agent_args;
-        }
-        // mcp_command is intentionally not applied here — the effective MCP
-        // command is always catalog-derived (known_acp_runtime at spawn time)
-        // and the per-record field is never read by the runtime.
-        if let Some(env_vars) = input.env_vars {
-            crate::managed_agents::validate_user_env_keys(&env_vars)?;
-            record.env_vars = env_vars;
-        }
+                    if let Some(name_update) = input.name {
+                        let trimmed = name_update.trim().to_string();
+                        if !trimmed.is_empty() && trimmed != record.name {
+                            record.name = trimmed;
+                            name_changed = true;
+                        }
+                    }
+                    apply_model_provider_prompt_update(
+                        record,
+                        input.model,
+                        input.provider,
+                        input.system_prompt,
+                    );
+                    if let Some(parallelism) = input.parallelism {
+                        record.parallelism = parallelism;
+                    }
+                    if let Some(relay_url) = input.relay_url {
+                        record.relay_url = relay_url.trim().to_string();
+                    }
+                    if let Some(acp_command) = input.acp_command {
+                        record.acp_command = acp_command;
+                    }
+                    if let Some(agent_command) = input.agent_command {
+                        crate::managed_agents::apply_agent_command_update(
+                            record,
+                            &personas_for_closure,
+                            &agent_command,
+                            input.harness_override,
+                        );
+                    }
+                    if let Some(agent_args) = input.agent_args {
+                        record.agent_args = agent_args;
+                    }
+                    if let Some(env_vars) = input.env_vars {
+                        crate::managed_agents::validate_user_env_keys(&env_vars)?;
+                        record.env_vars = env_vars;
+                    }
+                    if record.provider.as_deref()
+                        == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID)
+                    {
+                        let model_ref = record
+                            .model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or(crate::managed_agents::RELAY_MESH_AUTO_MODEL_ID)
+                            .to_string();
+                        record.model = Some(model_ref.clone());
+                        record.relay_mesh =
+                            Some(crate::managed_agents::RelayMeshConfig { model_ref });
+                    }
+                    let merged_mode = prospective_mode_opt.unwrap_or(record.respond_to);
+                    let merged_allowlist = prospective_allowlist_opt
+                        .clone()
+                        .unwrap_or_else(|| record.respond_to_allowlist.clone());
+                    if merged_mode == crate::managed_agents::RespondTo::Allowlist
+                        && merged_allowlist.is_empty()
+                    {
+                        return Err(
+                            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
+                                .to_string(),
+                        );
+                    }
+                    record.respond_to = merged_mode;
+                    if prospective_allowlist_opt.is_some() {
+                        record.respond_to_allowlist = merged_allowlist;
+                    }
+                    record.updated_at = crate::util::now_iso();
 
-        // Native provider/model fields are authoritative. Keep the typed marker
-        // derived for new records while retaining legacy typed records for
-        // non-native providers.
-        if record.provider.as_deref() == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID) {
-            let model_ref = record
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(crate::managed_agents::RELAY_MESH_AUTO_MODEL_ID)
-                .to_string();
-            record.model = Some(model_ref.clone());
-            record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
+                    let (current_gen, is_tombstone) = read_generation(journal, &pubkey_str)?;
+                    if is_tombstone {
+                        return Err(format!(
+                            "agent {pubkey_str} has been tombstoned; update rejected"
+                        ));
+                    }
+                    insert_operation(
+                        journal,
+                        &op_id_for_closure,
+                        "update",
+                        &pubkey_str,
+                        current_gen,
+                    )?;
+                    match cas_generation(journal, &pubkey_str, current_gen)? {
+                        CasOutcome::Committed { .. } => {}
+                        CasOutcome::Conflict { current } => {
+                            return Err(format!(
+                                "agent {pubkey_str} generation conflict (expected {}, got {}); retry",
+                                current_gen.0, current.0
+                            ));
+                        }
+                        CasOutcome::Tombstoned { .. } => {
+                            return Err(format!(
+                                "agent {pubkey_str} was concurrently tombstoned; update rejected"
+                            ));
+                        }
+                    }
+                    let record_out = record.clone();
+                    Ok((
+                        instances,
+                        (record_out, (name_changed, previous_record, exited)),
+                    ))
+                },
+            )?;
+
+        for pk in &exited_pubkeys {
+            state.clear_agent_session_caches(pk);
         }
-
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
-        let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
-        let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
-            Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
-            None => record.respond_to_allowlist.clone(),
-        };
-        if prospective_mode == crate::managed_agents::RespondTo::Allowlist
-            && prospective_allowlist.is_empty()
-        {
-            return Err(
-                "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
-                    .to_string(),
-            );
-        }
-        record.respond_to = prospective_mode;
-        // Preserve the persisted allowlist across mode toggles — only replace
-        // when the caller explicitly supplied a new list.
-        if input.respond_to_allowlist.is_some() {
-            record.respond_to_allowlist = prospective_allowlist;
-        }
-
-        record.updated_at = now_iso();
-
-        save_managed_agents(&app, &records)?;
-
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == input.pubkey)
-            .ok_or_else(|| format!("agent {} not found", input.pubkey))?;
-
-        // Publish the edit to the relay. After-save, inside the lock, before
-        // any .await. The retention upsert hashes the opt-IN projection, so an
-        // update that touched only runtime/local fields is a no-op publish.
-        super::agents::retain_managed_agent_pending(&app, &state, record);
+        // Retain first (inserts outbox evidence linked to op_id), then advance
+        // the operation to Committed — guarantees outbox row exists before op
+        // reaches terminal state.
+        super::agents::retain_managed_agent_pending(&app, &state, &record_out, Some(&op_id));
+        crate::managed_agents::store_journal::advance_to_committed(&app, &op_id);
 
         let sync_params = if name_changed {
-            let agent_keys = Keys::parse(&record.private_key_nsec)
+            let agent_keys = Keys::parse(&record_out.private_key_nsec)
                 .map_err(|e| format!("failed to parse agent keys: {e}"))?;
-            // Re-publish the renamed profile to the agent's effective relay:
-            // an explicit per-agent relay wins; empty falls back to workspace.
             let relay_url = crate::relay::effective_agent_relay_url(
-                &record.relay_url,
+                &record_out.relay_url,
                 &relay_ws_url_with_override(&state),
             );
-            let display_name = record.name.clone();
-            // Avatar fallback derives from the EFFECTIVE harness (persona-wins),
-            // not the frozen snapshot, so an inherited harness picks the right
-            // default avatar.
+            let display_name = record_out.name.clone();
             let personas = load_personas(&app).unwrap_or_default();
-            let effective_command = crate::managed_agents::record_agent_command(record, &personas);
-            let avatar_url = record
+            let effective_command =
+                crate::managed_agents::record_agent_command(&record_out, &personas);
+            let avatar_url = record_out
                 .avatar_url
                 .clone()
                 .or_else(|| managed_agent_avatar_url(&effective_command));
-            let auth_tag = record.auth_tag.clone();
+            let auth_tag = record_out.auth_tag.clone();
             Some((agent_keys, relay_url, display_name, avatar_url, auth_tag))
         } else {
             None
@@ -970,23 +969,24 @@ pub async fn update_managed_agent(
 
         let summary = {
             let personas = load_personas(&app).unwrap_or_default();
+            let rts = state
+                .managed_agent_processes
+                .lock()
+                .map_err(|e| e.to_string())?;
             build_managed_agent_summary(
                 &app,
-                record,
-                &runtimes,
+                &record_out,
+                &rts,
                 &personas,
                 &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
             )?
         };
-        let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, record));
-        (summary, sync_params, rollback)
+        let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, &record_out));
+        (summary, sync_params, rollback, op_id)
     }; // lock dropped here
 
     try_regenerate_nest(&app);
 
-    // Phase 2: relay profile sync (async, outside lock). A rename is committed
-    // only when this succeeds; otherwise restore the complete pre-edit record
-    // so Desktop and the relay keep one authoritative name.
     if let Some((agent_keys, relay_url, display_name, avatar_url, auth_tag)) = sync_params {
         if let Err(sync_error) = sync_managed_agent_profile(
             &state,
@@ -1017,9 +1017,7 @@ pub async fn update_managed_agent(
 // ── Model normalization ───────────────────────────────────────────────────────
 
 /// Normalize raw `buzz-acp models --json` output into a typed DTO for the frontend.
-///
-/// Merges models from both ACP paths (stable configOptions + unstable SessionModelState),
-/// deduplicates by ID (stable takes precedence), and returns a unified list.
+/// Merges stable configOptions + unstable SessionModelState, deduplicates by ID.
 pub(super) fn normalize_agent_models(
     raw: &serde_json::Value,
     persisted_model: Option<String>,
@@ -1036,8 +1034,7 @@ pub(super) fn normalize_agent_models(
     let mut models: Vec<AgentModelInfo> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
 
-    // 1. Stable configOptions (preferred). Only entries with category "model"
-    //    are model options — the CLI pre-filters, but we're defensive here.
+    // Stable configOptions (preferred): only "model" category entries.
     if let Some(config_options) = raw["stable"]["configOptions"].as_array() {
         for opt in config_options {
             if opt.get("category").and_then(|c| c.as_str()) != Some("model") {
@@ -1062,7 +1059,7 @@ pub(super) fn normalize_agent_models(
         }
     }
 
-    // 2. Unstable availableModels (fallback — skip duplicates from stable).
+    // Unstable availableModels (fallback — skip duplicates from stable).
     let mut agent_default_model: Option<String> = None;
     if let Some(unstable) = raw.get("unstable") {
         agent_default_model = unstable["currentModelId"].as_str().map(str::to_string);

@@ -209,6 +209,7 @@ pub struct RelayAgentInfo {
     pub respond_to_allowlist: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
     pub name: String,
@@ -761,6 +762,7 @@ pub struct AgentModelInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamRecord {
     pub id: String,
     pub name: String,
@@ -828,7 +830,6 @@ fn default_auto_restart_on_config_change() -> bool {
 fn default_record_active() -> bool {
     true
 }
-
 // ── Inbound author gate ──────────────────────────────────────────────────────
 //
 // Mirrors `buzz-acp`'s `--respond-to` CLI flag and the related
@@ -994,6 +995,5 @@ mod catalog_source;
 pub use catalog_source::CatalogSource;
 mod requests;
 pub use requests::*;
-
 #[cfg(test)]
 mod tests;

@@ -7,9 +7,9 @@ use tauri::AppHandle;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        apply_persona_behavior, effective_agent_command, load_managed_agents, load_personas,
-        managed_agent_avatar_url, save_managed_agents, save_personas, try_regenerate_nest,
-        AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
+        apply_persona_behavior, effective_agent_command, load_personas, managed_agent_avatar_url,
+        mutate_persona_store, try_regenerate_nest, AgentDefinition, ManagedAgentRecord,
+        UpdatePersonaRequest,
     },
     util::now_iso,
 };
@@ -96,43 +96,67 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let model = trim_optional(input.model);
             let provider = trim_optional(input.provider);
 
-            let _store_guard = state
+            let store_guard = state
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
-            let mut personas = load_personas(&app)?;
-            pending::project_active_persona_sharing(&app, &state, &mut personas);
-            let persona = personas
-                .iter_mut()
-                .find(|record| record.id == input.id)
-                .ok_or_else(|| format!("agent {} not found", input.id))?;
 
-            // Track what changed so we can propagate to linked agent records.
-            let avatar_changed = persona.avatar_url != avatar_url;
-            let name_changed = persona.display_name != display_name;
-            let old_display_name = persona.display_name.clone();
+            // Load personas for sharing projection before the closure.
+            let mut personas_pre = load_personas(&app).unwrap_or_default();
+            pending::project_active_persona_sharing(&app, &state, &mut personas_pre);
 
-            persona.display_name = display_name;
-            persona.avatar_url = avatar_url;
-            persona.system_prompt = system_prompt;
-            persona.runtime = runtime;
-            persona.model = model;
-            persona.provider = provider;
-            persona.name_pool = input
+            // Validate the persona exists and capture pre-mutation context.
+            let input_id = input.id.clone();
+            let pre_persona = personas_pre
+                .iter()
+                .find(|record| record.id == input_id)
+                .ok_or_else(|| format!("agent {} not found", input_id))?
+                .clone();
+            let avatar_changed = pre_persona.avatar_url != avatar_url;
+            let name_changed = pre_persona.display_name != display_name;
+            let old_display_name = pre_persona.display_name.clone();
+
+            let input_id_c = input.id.clone();
+            let display_name_c = display_name.clone();
+            let avatar_url_c = avatar_url.clone();
+            let system_prompt_c = system_prompt.clone();
+            let runtime_c = runtime.clone();
+            let model_c = model.clone();
+            let provider_c = provider.clone();
+            let name_pool_c = input
                 .name_pool
-                .into_iter()
+                .iter()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect();
-            if let Some(env_vars) = input.env_vars {
-                crate::managed_agents::validate_user_env_keys(&env_vars)?;
-                persona.env_vars = env_vars;
-            }
-            apply_persona_behavior(persona, input.behavior)?;
-            persona.updated_at = now_iso();
+                .collect::<Vec<_>>();
+            let env_vars_c = input.env_vars.clone();
+            let behavior_c = input.behavior.clone();
+            let now_c = now_iso();
 
-            let result = persona.clone();
-            save_personas(&app, &personas)?;
+            let (result, store_guard_after_persona) =
+                mutate_persona_store(&app, store_guard, move |mut defs| {
+                    let persona = defs
+                        .iter_mut()
+                        .find(|record| record.id == input_id_c)
+                        .ok_or_else(|| format!("agent {} not found", input_id_c))?;
+
+                    persona.display_name = display_name_c;
+                    persona.avatar_url = avatar_url_c;
+                    persona.system_prompt = system_prompt_c;
+                    persona.runtime = runtime_c;
+                    persona.model = model_c;
+                    persona.provider = provider_c;
+                    persona.name_pool = name_pool_c;
+                    if let Some(env_vars) = env_vars_c {
+                        crate::managed_agents::validate_user_env_keys(&env_vars)?;
+                        persona.env_vars = env_vars;
+                    }
+                    apply_persona_behavior(persona, behavior_c)?;
+                    persona.updated_at = now_c;
+
+                    let result = persona.clone();
+                    Ok((defs, result))
+                })?;
 
             let retained = retain(&app, &state, &result)?;
             try_regenerate_nest(&app);
@@ -140,81 +164,87 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             // If the avatar or display_name changed, propagate to linked agent
             // records and collect relay profile sync params for the async phase.
             let sync_params: ProfileSyncParams = if avatar_changed || name_changed {
-                let mut records = load_managed_agents(&app)?;
                 let mut params: ProfileSyncParams = Vec::new();
-                let mut agents_modified = false;
                 let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+                let result_clone = result.clone();
+                let workspace_relay_clone = workspace_relay.clone();
 
-                // Propagate the display_name rename to instances that still
-                // carry the old definition display_name (pool-named instances
-                // keep their individualised name) in one pass; the loop below
-                // only decides which records need a relay profile sync.
-                let renamed: Vec<String> = if name_changed {
-                    propagate_persona_name_rename(
-                        &mut records,
-                        &result.id,
-                        &old_display_name,
-                        &result.display_name,
-                    )
-                } else {
-                    Vec::new()
-                };
+                // Drop the persona-store guard before acquiring a fresh agent-store guard.
+                drop(store_guard_after_persona);
+                let store_guard2 = state
+                    .managed_agents_store_lock
+                    .lock()
+                    .map_err(|e| e.to_string())?;
 
-                for record in records.iter_mut() {
-                    if record.persona_id.as_deref() != Some(&result.id) {
-                        continue;
-                    }
-                    let mut record_changed = renamed.contains(&record.pubkey);
+                let ((renamed, agent_sync_params), _guard) =
+                    crate::managed_agents::mutate_agent_store(
+                        &app,
+                        store_guard2,
+                        move |mut instances, _journal| {
+                            let renamed: Vec<String> = if name_changed {
+                                propagate_persona_name_rename(
+                                    &mut instances,
+                                    &result_clone.id,
+                                    &old_display_name,
+                                    &result_clone.display_name,
+                                )
+                            } else {
+                                Vec::new()
+                            };
 
-                    if avatar_changed {
-                        // Update the persisted avatar so reconciliation on next
-                        // start agrees with what we're about to publish.
-                        // When the persona avatar is cleared, fall back to the
-                        // command-default icon so the record never stores `None`
-                        // (which reconcile_agent_profile treats as "un-migrated").
-                        let effective_cmd = effective_agent_command(
-                            record.persona_id.as_deref(),
-                            std::slice::from_ref(&result),
-                            record.agent_command_override.as_deref(),
+                            let mut agent_params: ProfileSyncParams = Vec::new();
+                            for record in instances.iter_mut() {
+                                if record.persona_id.as_deref() != Some(&result_clone.id) {
+                                    continue;
+                                }
+                                let mut record_changed = renamed.contains(&record.pubkey);
+
+                                if avatar_changed {
+                                    let effective_cmd = effective_agent_command(
+                                        record.persona_id.as_deref(),
+                                        std::slice::from_ref(&result_clone),
+                                        record.agent_command_override.as_deref(),
+                                    );
+                                    record.avatar_url = result_clone
+                                        .avatar_url
+                                        .clone()
+                                        .or_else(|| managed_agent_avatar_url(&effective_cmd));
+                                    record_changed = true;
+                                }
+
+                                if record_changed {
+                                    if let Ok(agent_keys) =
+                                        nostr::Keys::parse(&record.private_key_nsec)
+                                    {
+                                        let relay_url = crate::relay::effective_agent_relay_url(
+                                            &record.relay_url,
+                                            &workspace_relay_clone,
+                                        );
+                                        agent_params.push((
+                                            agent_keys,
+                                            relay_url,
+                                            record.name.clone(),
+                                            record.avatar_url.clone(),
+                                            record.auth_tag.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok((instances, (renamed, agent_params)))
+                        },
+                    )?;
+
+                if !renamed.is_empty() || avatar_changed {
+                    // Load the fresh records for retain calls.
+                    let fresh_records =
+                        crate::managed_agents::load_managed_agents(&app).unwrap_or_default();
+                    for record in fresh_records.iter().filter(|r| renamed.contains(&r.pubkey)) {
+                        crate::commands::agents::retain_managed_agent_pending(
+                            &app, &state, record, None,
                         );
-                        record.avatar_url = result
-                            .avatar_url
-                            .clone()
-                            .or_else(|| managed_agent_avatar_url(&effective_cmd));
-                        record_changed = true;
-                    }
-
-                    if record_changed {
-                        agents_modified = true;
-                        if let Ok(agent_keys) = nostr::Keys::parse(&record.private_key_nsec) {
-                            let relay_url = crate::relay::effective_agent_relay_url(
-                                &record.relay_url,
-                                &workspace_relay,
-                            );
-                            params.push((
-                                agent_keys,
-                                relay_url,
-                                record.name.clone(),
-                                record.avatar_url.clone(),
-                                record.auth_tag.clone(),
-                            ));
-                        }
                     }
                 }
-
-                if agents_modified {
-                    save_managed_agents(&app, &records)?;
-                    // Keep retained kind:30177 identity records in lockstep with
-                    // the rename (#2423): `record.name` is part of the published
-                    // identity projection, so skipping this strands the relay on
-                    // the stale name→pubkey binding until the next boot reconcile.
-                    // Avatar-only edits are excluded — the avatar is not in the
-                    // projection, so retaining would be a guaranteed no-op.
-                    for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
-                    }
-                }
-
+                params.extend(agent_sync_params);
                 params
             } else {
                 Vec::new()

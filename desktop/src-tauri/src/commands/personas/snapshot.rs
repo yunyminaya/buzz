@@ -23,6 +23,7 @@ use crate::{
 };
 
 pub(crate) mod import;
+mod retain;
 
 // Re-export import-side commands so callers see a flat `snapshot::` namespace.
 pub use import::{confirm_agent_snapshot_import, preview_agent_snapshot_import};

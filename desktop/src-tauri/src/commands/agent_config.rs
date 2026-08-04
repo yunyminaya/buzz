@@ -13,7 +13,7 @@ use crate::{
             },
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
-        known_acp_runtime, load_managed_agents, load_personas, save_managed_agents,
+        known_acp_runtime, load_managed_agents, load_personas, mutate_agent_store,
         sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig, KnownAcpRuntime,
         ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
     },
@@ -252,27 +252,32 @@ pub async fn get_agent_config_surface(
     state: State<'_, AppState>,
 ) -> Result<RuntimeConfigSurface, String> {
     let record = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
+        let instance_id = current_instance_id(&app);
+
+        let pubkey_for_closure = pubkey.clone();
+        let ((record, exited_pubkeys), _guard) =
+            mutate_agent_store(&app, store_guard, move |mut instances, _journal| {
+                let (_, exited) =
+                    sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
+                let record = instances
+                    .iter()
+                    .find(|r| r.pubkey == pubkey_for_closure)
+                    .ok_or_else(|| format!("agent {pubkey_for_closure} not found"))?
+                    .clone();
+                Ok((instances, (record, exited)))
+            })?;
+        for pk in &exited_pubkeys {
+            state.clear_agent_session_caches(pk);
         }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
-        records
-            .into_iter()
-            .find(|r| r.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?
+        record
     };
 
     let personas = load_personas(&app).unwrap_or_default();

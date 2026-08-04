@@ -538,7 +538,7 @@ fn patch_json_records_rewrites_secret_store_owner_only() {
     let path = dir.path().join("agents/managed-agents.json");
 
     // Mutate so the write actually fires (it only writes back on `changed`).
-    patch_json_records(&path, |obj| {
+    patch_json_records(&path, path.parent().unwrap_or(&path), |obj| {
         let provider = obj.remove("provider").unwrap();
         obj.insert("runtime".to_string(), provider);
         true

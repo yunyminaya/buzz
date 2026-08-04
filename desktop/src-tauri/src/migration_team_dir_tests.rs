@@ -41,7 +41,11 @@ fn detach_lifts_instructions_from_instructions_md() {
         }]),
     );
 
-    let n = super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    let n = super::detach::detach_directory_backed_teams_in_dir(
+        &base.join("agents"),
+        &base.join("agents"),
+    )
+    .unwrap();
     assert_eq!(n, 1);
 
     let teams = read_teams_json(base);
@@ -74,7 +78,8 @@ fn detach_skips_lift_if_instructions_already_set() {
         }]),
     );
 
-    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents"), &base.join("agents"))
+        .unwrap();
 
     let teams = read_teams_json(base);
     // Should keep the pre-existing instructions, not overwrite with disk content
@@ -105,7 +110,8 @@ fn detach_clears_is_symlink_and_version() {
         }]),
     );
 
-    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents"), &base.join("agents"))
+        .unwrap();
 
     let teams = read_teams_json(base);
     assert_eq!(teams[0]["is_symlink"], false);
@@ -160,7 +166,8 @@ fn detach_backfills_team_id_on_agents() {
         }]),
     );
 
-    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    super::detach::detach_directory_backed_teams_in_dir(&base.join("agents"), &base.join("agents"))
+        .unwrap();
 
     let agents = read_agents_json(base);
     assert_eq!(agents[0]["team_id"], "team-uuid-1");
@@ -196,11 +203,19 @@ fn detach_is_idempotent_on_second_run() {
     );
 
     // First run
-    let n1 = super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    let n1 = super::detach::detach_directory_backed_teams_in_dir(
+        &base.join("agents"),
+        &base.join("agents"),
+    )
+    .unwrap();
     assert_eq!(n1, 1);
 
     // Second run — should be a no-op
-    let n2 = super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    let n2 = super::detach::detach_directory_backed_teams_in_dir(
+        &base.join("agents"),
+        &base.join("agents"),
+    )
+    .unwrap();
     assert_eq!(n2, 0);
 
     // Instructions should still be set from first run
@@ -227,7 +242,11 @@ fn detach_skips_non_directory_backed_teams() {
         }]),
     );
 
-    let n = super::detach::detach_directory_backed_teams_in_dir(&base.join("agents")).unwrap();
+    let n = super::detach::detach_directory_backed_teams_in_dir(
+        &base.join("agents"),
+        &base.join("agents"),
+    )
+    .unwrap();
     assert_eq!(n, 0);
 
     // File should not have been modified
@@ -293,7 +312,7 @@ fn detach_retries_after_teams_write_failure() {
     std::fs::set_permissions(&agents_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     // Boot 1: detach fails because neither file can be written.
-    let result = super::detach::detach_directory_backed_teams_in_dir(&agents_dir);
+    let result = super::detach::detach_directory_backed_teams_in_dir(&agents_dir, &agents_dir);
     assert!(
         result.is_err(),
         "detach must fail when directory is read-only"
@@ -312,7 +331,7 @@ fn detach_retries_after_teams_write_failure() {
     );
 
     // Boot 2: retry with writable directory — should succeed.
-    let n2 = super::detach::detach_directory_backed_teams_in_dir(&agents_dir).unwrap();
+    let n2 = super::detach::detach_directory_backed_teams_in_dir(&agents_dir, &agents_dir).unwrap();
     assert_eq!(n2, 1, "retry detach must succeed");
 
     let teams_after_retry = read_teams_json(base);

@@ -400,35 +400,49 @@ fn running_relay_mesh_model_id(
 
 fn persist_mesh_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
-    let mut records = crate::managed_agents::load_managed_agents(app)?;
-    let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
-    record.last_error = Some(error.to_string());
-    record.updated_at = crate::util::now_iso();
-    crate::managed_agents::save_managed_agents(app, &records)
+    let error_owned = error.to_string();
+    let (_, _, _guard) = crate::managed_agents::storage::mutate_managed_agent(
+        app,
+        store_guard,
+        pubkey,
+        move |record, _journal| {
+            record.last_error = Some(error_owned);
+            record.updated_at = crate::util::now_iso();
+            Ok(())
+        },
+    )?;
+    Ok(())
 }
 
 fn clear_mesh_last_error_if_set(app: &AppHandle, pubkey: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
-    let mut records = crate::managed_agents::load_managed_agents(app)?;
-    let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
-    if !record
-        .last_error
-        .as_deref()
-        .is_some_and(|error| error.starts_with(MESH_REARM_ERROR_SENTINEL))
-    {
-        return Ok(());
-    }
-    record.last_error = None;
-    record.updated_at = crate::util::now_iso();
-    crate::managed_agents::save_managed_agents(app, &records)
+    let (_, cleared, _guard) = crate::managed_agents::storage::mutate_managed_agent(
+        app,
+        store_guard,
+        pubkey,
+        move |record, _journal| {
+            if !record
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(MESH_REARM_ERROR_SENTINEL))
+            {
+                return Ok(false);
+            }
+            record.last_error = None;
+            record.updated_at = crate::util::now_iso();
+            Ok(true)
+        },
+    )?;
+    let _ = cleared; // result: whether the error was cleared
+    Ok(())
 }
 
 #[cfg(test)]

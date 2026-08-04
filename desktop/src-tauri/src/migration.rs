@@ -15,6 +15,7 @@
 //! discovery table. Ensures known providers always have their canonical
 //! `mcp_command`; unknown/custom agents are left untouched.
 
+use crate::managed_agents::store_journal::atomic_write_restricted_with_fsync as write_restricted;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -106,19 +107,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// agent restore. Ordering is load-bearing: `migrate_legacy_app_data_dir` must
 /// precede any disk read, and `sync_shared_agent_data` must precede
 /// `restore_managed_agents_on_launch` (which reads `managed-agents.json`).
-/// Identity-dependent migrations (persona/team event signing) run separately in
-/// boot setup after the persisted identity is resolved.
 ///
-/// # Ordering
-/// `sync_team_personas` is the sole writer of team-dir persona-runtime edits
-/// into `personas.json`/`teams.json`; it MUST run before every reader of those
-/// files. The pre-identity reader is `reconcile_provider_mcp_commands` (derives
-/// `mcp_command` from each persona's effective harness); the post-identity
-/// readers are `migrate_personas_to_events`/`migrate_teams_to_events` in
-/// [`crate::event_sync::run_event_sync`]. Sync touches only JSON (no owner
-/// keys, no `retention.db`), so it runs pre-identity here ahead of all
-/// readers — reader-first loses a launch (stale harness/`mcp_command` until
-/// the next boot).
+/// `sync_team_personas` runs before `reconcile_provider_mcp_commands` (and
+/// before event-sync readers) because it is the sole writer of team-dir
+/// persona/harness edits into `personas.json`/`teams.json`.
 pub fn run_boot_migrations(app: &tauri::AppHandle) {
     run_boot_migrations_inner(app, false);
 }
@@ -482,17 +474,17 @@ fn copy_file_over_generated_default(src: &Path, dst: &Path) -> std::io::Result<(
     std::fs::copy(src, dst).map(|_| ())
 }
 
-/// Read a JSON array of objects from `path`, apply `f` to each object,
-/// and write back if any mutation returned `true`.
-///
-/// Writes back via [`crate::managed_agents::atomic_write_json_restricted`]
-/// (owner-only `0o600`): the store files this rewrites can carry plaintext
-/// agent nsecs on a keyringless host, so the write must not reopen the umask
-/// window SECURITY.md:90 closes.
+/// Read a JSON array of objects from `path`, apply `f` to each object, and
+/// write back atomically (advisory-locked) if any mutation returned `true`.
 fn patch_json_records(
     path: &Path,
+    anchor: &Path,
     mut f: impl FnMut(&mut serde_json::Map<String, serde_json::Value>) -> bool,
 ) {
+    let Ok(_advisory) = crate::managed_agents::store_journal::JournalLockGuard::acquire(anchor)
+    else {
+        return;
+    };
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
@@ -511,7 +503,7 @@ fn patch_json_records(
     }
     if changed {
         if let Ok(bytes) = serde_json::to_vec_pretty(&records) {
-            if let Err(e) = crate::managed_agents::atomic_write_json_restricted(path, &bytes) {
+            if let Err(e) = write_restricted(path, &bytes) {
                 eprintln!("buzz-desktop: patch-json-records: {e}");
             }
         }
@@ -560,10 +552,10 @@ struct LegacyAvatarMatch<'a> {
 /// idempotent and avoids relying on timestamps or other persona fields the
 /// user may also have edited.
 fn refresh_builtin_agent_avatars(app: &tauri::AppHandle) {
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(anchor) = crate::managed_agents::store_journal::store_anchor_dir(app) else {
         return;
     };
-    let path = dir.join("agents/managed-agents.json");
+    let path = anchor.join("managed-agents.json");
     if path.exists() {
         refresh_builtin_agent_avatars_in_file(
             &path,
@@ -662,7 +654,7 @@ fn refresh_builtin_agent_avatars_in_file(
 
     if changed {
         if let Ok(bytes) = serde_json::to_vec_pretty(&records) {
-            if let Err(e) = crate::managed_agents::atomic_write_json_restricted(path, &bytes) {
+            if let Err(e) = write_restricted(path, &bytes) {
                 eprintln!("buzz-desktop: refresh-builtin-agent-avatars: {e}");
             }
         }
@@ -709,7 +701,7 @@ fn uploaded_media_sha256(avatar_url: &str) -> Option<String> {
 
 fn persona_version_from_record(record: &serde_json::Value) -> Option<String> {
     let record: crate::managed_agents::ManagedAgentRecord =
-        serde_json::from_value(record.clone()).ok()?;
+        crate::managed_agents::store_journal::decode_agent_record_permissive(record.clone())?;
     let definition = record.to_definition_view()?;
     Some(crate::managed_agents::persona_events::persona_content_hash(
         &crate::managed_agents::persona_events::persona_event_content(&definition),
@@ -833,6 +825,12 @@ pub fn sync_shared_agent_data(app: &tauri::AppHandle) {
         );
         return;
     }
+
+    let Ok(_advisory) = crate::managed_agents::store_journal::JournalLockGuard::acquire(
+        &canonical_dir.join("agents"),
+    ) else {
+        return;
+    };
 
     // Seed-up: if canonical is missing a shared file but a sibling instance
     // holds real (non-symlink) content, migrate it up to canonical before the
@@ -979,7 +977,7 @@ fn reconcile_mcp_commands_in_file(path: &Path) {
     // from the sibling personas.json; missing entries fall back to the record's
     // own agent_command (the create-time snapshot).
     let persona_runtimes = load_persona_runtimes(path);
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let override_cmd = obj
             .get("agent_command_override")
             .and_then(|v| v.as_str())
@@ -1050,7 +1048,7 @@ fn replace_command_field(
 }
 
 fn reconcile_legacy_command_names_in_file(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let mut changed = false;
 
         if let Some(acp_command) = obj
@@ -1100,7 +1098,7 @@ fn reconcile_legacy_command_names_in_file(path: &Path) {
 }
 
 fn reconcile_legacy_persona_runtimes_in_file(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let Some(runtime) = obj.get("runtime").and_then(|v| v.as_str()) else {
             return false;
         };
@@ -1237,7 +1235,7 @@ pub fn reconcile_provider_mcp_commands(app: &tauri::AppHandle) {
 
 fn reconcile_databricks_v1_to_v2_in_file(path: &Path, rewrite_v1_provider: bool) {
     use crate::managed_agents::is_derived_provider_model_key;
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         let mut changed = false;
 
         // Only rewrite the structured provider field when the baked build env
@@ -1344,7 +1342,7 @@ pub fn reconcile_databricks_v1_to_v2(app: &tauri::AppHandle) {
 }
 
 fn rename_provider_to_runtime_in_personas(path: &Path) {
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         if obj.contains_key("runtime") {
             return false;
         }

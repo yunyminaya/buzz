@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, delete_agent_key, load_managed_agents, load_personas, load_teams,
-        save_managed_agents, save_personas, stop_managed_agent_process,
+        mutate_agent_store, mutate_persona_store, stop_managed_agent_process,
         sync_managed_agent_processes, try_regenerate_nest, validate_persona_activation_change,
         validate_persona_deletion, AgentDefinition, ManagedAgentRecord,
     },
@@ -100,11 +100,16 @@ fn collect_remote_deployed(
 /// this function propagates it before the keyring deletions and tombstones that
 /// appear after the `?` in the call site — nothing is destroyed and the command
 /// is safe to retry.
-fn commit_cascade_agents(
+///
+/// Generic over `G` so callers that need the store guard returned by
+/// `save_managed_agents` (which returns `Result<MutexGuard, String>`) can thread
+/// it back; tests use `G = ()`.
+#[cfg(test)]
+fn commit_cascade_agents<G>(
     agents: &mut Vec<ManagedAgentRecord>,
     cascade: &std::collections::HashSet<String>,
-    save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
-) -> Result<(), String> {
+    save: impl FnOnce(&[ManagedAgentRecord]) -> Result<G, String>,
+) -> Result<G, String> {
     agents.retain(|a| !cascade.contains(&a.pubkey));
     save(agents)
 }
@@ -118,13 +123,13 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
         {
             // Store lock held across all three phases.
             // Lock ordering: store lock (acquired here) → process lock (per-agent in Phase 2).
-            let _store_guard = state
+            let store_guard = state
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
 
             // Load and validate the persona before any destructive work.
-            let mut personas = load_personas(&app)?;
+            let personas = load_personas(&app)?;
             let persona = personas
                 .iter()
                 .find(|record| record.id == id)
@@ -147,23 +152,38 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             // then released before Phase 2 stops). Every fallible read/lock is
             // here; an error leaves all state intact and the command is retryable.
             let mut agents = load_managed_agents(&app)?;
-            {
+            let sync_exited = {
                 let mut runtimes = state
                     .managed_agent_processes
                     .lock()
                     .map_err(|error| error.to_string())?;
-                let (sync_changed, exited_pubkeys) = sync_managed_agent_processes(
+                sync_managed_agent_processes(
                     &mut agents,
                     &mut runtimes,
                     &current_instance_id(&app),
-                );
-                if sync_changed {
-                    save_managed_agents(&app, &agents)?;
-                }
-                for pk in &exited_pubkeys {
-                    state.clear_agent_session_caches(pk);
-                }
+                )
                 // runtimes drops here (process lock released before Phase 2).
+            };
+            // If sync detected exited processes, persist their exit state atomically.
+            let store_guard = if sync_exited.0 {
+                let synced = agents.clone();
+                let ((), sg) = mutate_agent_store(&app, store_guard, move |mut instances, _j| {
+                    // Apply the same exit-state updates to the freshly-decoded instances.
+                    for updated in &synced {
+                        if let Some(live) = instances.iter_mut().find(|r| r.pubkey == updated.pubkey) {
+                            live.last_exit_code = updated.last_exit_code;
+                            live.last_stopped_at = updated.last_stopped_at.clone();
+                            live.updated_at = updated.updated_at.clone();
+                        }
+                    }
+                    Ok((instances, ()))
+                })?;
+                sg
+            } else {
+                store_guard
+            };
+            for pk in &sync_exited.1 {
+                state.clear_agent_session_caches(pk);
             }
 
             // Build the cascade set. HashSet for O(1) membership in Phase 3.
@@ -209,37 +229,66 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             // ── Phase 3: Commit ─────────────────────────────────────────────
             //
             // Disk-authoritative writes first, side effects strictly after.
-            // commit_cascade_agents is an injectable seam so unit tests can
-            // verify retry-safety: a failing save propagates before any keyring
-            // deletion or tombstone occurs.
-            //
             // Failure semantics:
             //   agent save fails   → nothing destroyed; full cascade retries cleanly
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
-            if !cascade.is_empty() {
-                commit_cascade_agents(&mut agents, &cascade, |recs| {
-                    save_managed_agents(&app, recs)
-                })?;
-            }
+            let store_guard = if !cascade.is_empty() {
+                let cascade_for_closure = cascade.clone();
+                let ((), sg) =
+                    mutate_agent_store(&app, store_guard, move |mut instances, journal| {
+                        // Tombstone each cascaded agent pubkey in the journal before
+                        // removing the record — mirrors the single-agent delete path.
+                        for pubkey in &cascade_for_closure {
+                            if pubkey.is_empty() {
+                                continue;
+                            }
+                            let (current_gen, _) =
+                                crate::managed_agents::store_journal::read_generation(
+                                    journal,
+                                    pubkey,
+                                )?;
+                            crate::managed_agents::store_journal::tombstone_key(
+                                journal,
+                                pubkey,
+                                current_gen,
+                            )?;
+                        }
+                        instances.retain(|a| !cascade_for_closure.contains(&a.pubkey));
+                        Ok((instances, ()))
+                    })?;
+                sg
+            } else {
+                store_guard
+            };
 
-            let original_len = personas.len();
-            personas.retain(|record| record.id != id);
-            if personas.len() == original_len {
-                return Err(format!("persona {id} not found"));
-            }
-            save_personas(&app, &personas)?;
+            let id_for_closure = id.clone();
+            let ((), _guard) =
+                mutate_persona_store(&app, store_guard, move |mut defs| {
+                    let original_len = defs.len();
+                    defs.retain(|record| record.id != id_for_closure);
+                    if defs.len() == original_len {
+                        return Err(format!("persona {id_for_closure} not found"));
+                    }
+                    Ok((defs, ()))
+                })?;
 
             // Side effects — strictly after records leave disk.
             for pk in &cascade {
                 state.clear_agent_session_caches(pk);
                 // Remove nsec from keyring after the record is gone.
                 delete_agent_key(pk);
-                super::agents::tombstone_managed_agent_pending(&app, &state, pk);
-                super::agents::archive_managed_agent_pending(&app, &state, pk);
+                if let Err(e) = super::agents::tombstone_managed_agent_pending(&app, &state, pk) {
+                    eprintln!("buzz-desktop: persona-delete: agent tombstone failed for {pk}: {e}");
+                }
+                if let Err(e) = super::agents::archive_managed_agent_pending(&app, &state, pk) {
+                    eprintln!("buzz-desktop: persona-delete: agent archive failed for {pk}: {e}");
+                }
             }
-            tombstone_persona_pending(&app, &state, &d_tag);
+            if let Err(e) = tombstone_persona_pending(&app, &state, &d_tag) {
+                eprintln!("buzz-desktop: persona-delete: tombstone failed for {d_tag}: {e}");
+            }
 
             // _store_guard drops here, before try_regenerate_nest.
         }
@@ -261,10 +310,10 @@ pub async fn set_persona_active(
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
+
+        // Load and validate before acquiring the store lock — load_personas may
+        // call save_personas internally (built-in merge write-back) which also
+        // acquires the lock; acquiring the lock first would deadlock.
         let mut personas = load_personas(&app)?;
         let persona = personas
             .iter_mut()
@@ -297,7 +346,22 @@ pub async fn set_persona_active(
         persona.updated_at = now_iso();
 
         let updated = persona.clone();
-        save_personas(&app, &personas)?;
+
+        // Acquire the store lock for the write. load_personas above has already
+        // flushed the built-in merge if needed, so no re-entrant lock risk here.
+        let store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let id_for_closure = id.clone();
+        let updated_at_for_closure = updated.updated_at.clone();
+        let ((), _guard) = mutate_persona_store(&app, store_guard, move |mut defs| {
+            if let Some(def) = defs.iter_mut().find(|d| d.id == id_for_closure) {
+                def.is_active = active;
+                def.updated_at = updated_at_for_closure;
+            }
+            Ok((defs, ()))
+        })?;
         try_regenerate_nest(&app);
         Ok(updated)
     })

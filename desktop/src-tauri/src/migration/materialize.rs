@@ -44,7 +44,7 @@ fn materialize_runtimes_in_file(path: &Path) {
     if persona_runtimes.is_empty() {
         return;
     }
-    patch_json_records(path, |obj| {
+    patch_json_records(path, path.parent().unwrap_or(path), |obj| {
         if obj.contains_key("runtime") {
             return false;
         }

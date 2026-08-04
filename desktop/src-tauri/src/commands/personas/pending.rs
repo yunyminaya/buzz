@@ -53,24 +53,64 @@ pub(in crate::commands) fn retain_persona_pending(
 /// exact share tag. The explicit share toggle passes `Some(shared)`. Returning
 /// the retained event lets that command immediately await relay acceptance
 /// without rebuilding or re-signing a different NIP-33 head.
+///
+/// Internal ordering (B1 journal protocol):
+/// 1. Build and sign the event (no DB write).
+/// 2. Insert journal outbox evidence first — `?`-propagated.
+/// 3. Insert the retention row via `prepare_publication` — `?`-propagated.
 pub(super) fn prepare_persona_publication(
     app: &AppHandle,
     state: &AppState,
     persona: &AgentDefinition,
     shared_override: Option<bool>,
 ) -> Result<PreparedPersonaPublication, String> {
+    use crate::managed_agents::retention::open_retention_db;
+    use buzz_core_pkg::kind::KIND_PERSONA;
+    use nostr::JsonUtil;
+
     let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-    let (event, retained, persona) = prepare_persona_publication_at(
+
+    // Build and sign the event without writing to retention yet.
+    let (event, retained, scoped_persona) = build_persona_publication_event(
         &scope.db_path,
         &scope.owner_keys,
         persona,
         shared_override,
     )?;
+
+    // B1 journal outbox: record immutable event identity before retention.
+    let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
+    std::fs::create_dir_all(&anchor)
+        .map_err(|e| format!("create anchor dir for persona outbox: {e}"))?;
+    let journal = crate::managed_agents::store_journal::open_journal(&anchor)?;
+    let pub_op_id = crate::managed_agents::store_journal::new_operation_id();
+    crate::managed_agents::store_journal::insert_operation(
+        &journal,
+        &pub_op_id,
+        "publish",
+        &retained.d_tag,
+        crate::managed_agents::store_journal::Generation::zero(),
+    )?;
+
+    let conn = open_retention_db(&scope.db_path)?;
+    crate::managed_agents::store_journal::prepare_publication(
+        &journal,
+        &conn,
+        &pub_op_id,
+        &event.id.to_hex(),
+        &event.as_json(),
+        KIND_PERSONA,
+        &retained.pubkey,
+        &retained.d_tag,
+        &retained.content,
+        retained.created_at,
+    )?;
+
     Ok(PreparedPersonaPublication {
         scope,
         event,
         retained,
-        persona,
+        persona: scoped_persona,
     })
 }
 
@@ -145,7 +185,14 @@ fn project_persona_sharing_at(
     Ok(())
 }
 
-pub(super) fn prepare_persona_publication_at(
+/// Build and sign a persona event, constructing the `RetainedEvent` projection,
+/// WITHOUT writing anything to the retention DB.
+///
+/// Used by the production path (`prepare_persona_publication`) which wires
+/// journal outbox evidence through `prepare_publication` before writing to
+/// retention.  The test-only path (`prepare_persona_publication_at`) calls
+/// this then writes directly, bypassing the journal.
+fn build_persona_publication_event(
     db_path: &std::path::Path,
     keys: &nostr::Keys,
     persona: &AgentDefinition,
@@ -153,7 +200,7 @@ pub(super) fn prepare_persona_publication_at(
 ) -> Result<(nostr::Event, RetainedEvent, AgentDefinition), String> {
     use crate::managed_agents::{
         persona_events::{build_persona_event, monotonic_created_at, persona_d_tag},
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{get_retained_event, open_retention_db, RetainedEvent},
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
     use nostr::JsonUtil;
@@ -180,6 +227,28 @@ pub(super) fn prepare_persona_publication_at(
         raw_event: event.as_json(),
         pending_sync: true,
     };
+    Ok((event, retained, scoped_persona))
+}
+
+/// Build, sign, and retain a persona event in the given retention DB directly,
+/// without journal outbox evidence.
+///
+/// **Test-only path.** Production writes go through `prepare_persona_publication`
+/// which wires journal outbox evidence via `prepare_publication` before writing
+/// to retention.
+#[cfg(test)]
+pub(super) fn prepare_persona_publication_at(
+    db_path: &std::path::Path,
+    keys: &nostr::Keys,
+    persona: &AgentDefinition,
+    shared_override: Option<bool>,
+) -> Result<(nostr::Event, RetainedEvent, AgentDefinition), String> {
+    use crate::managed_agents::retention::retain_event;
+
+    let (event, retained, scoped_persona) =
+        build_persona_publication_event(db_path, keys, persona, shared_override)?;
+    // Test-only direct path: write retention without journal evidence.
+    let conn = crate::managed_agents::retention::open_retention_db(db_path)?;
     retain_event(&conn, &retained)?;
     Ok((event, retained, scoped_persona))
 }
@@ -196,51 +265,65 @@ pub(super) fn prepare_persona_publication_at(
 /// pubkey, d_tag)` (distinct from the purged persona row) with `pending_sync =
 /// 1`; the flush loop publishes it. Best-effort: a failure is logged and
 /// swallowed so a retention hiccup never blocks the disk-authoritative delete.
+///
+/// Internal ordering (B1 journal protocol): outbox evidence inserted first via
+/// `prepare_publication` before the retention row is set flushable.
+/// Returns `Err` if journal outbox evidence cannot be established — callers
+/// should log the error; there is no boot-reconcile fallback for tombstones.
 pub(in crate::commands) fn tombstone_persona_pending(
     app: &AppHandle,
     state: &AppState,
     d_tag: &str,
-) {
+) -> Result<(), String> {
     use crate::managed_agents::{
         persona_events::build_persona_delete,
-        retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
-        },
+        retention::{delete_retained_event, open_retention_db, tombstone_retention_d_tag},
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
     use nostr::JsonUtil;
 
     const KIND_DELETE: u32 = 5;
 
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let pubkey = scope.owner_keys.public_key().to_hex();
-        let event = build_persona_delete(d_tag, &pubkey)?
-            .sign_with_keys(&scope.owner_keys)
-            .map_err(|e| format!("failed to sign persona tombstone: {e}"))?;
-        let conn = open_retention_db(&scope.db_path)?;
-        // Purge the persona row first so an unpublished edit can never resurrect
-        // it after the tombstone publishes.
-        delete_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)?;
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
-                pubkey,
-                // Key by the target coordinate so cross-kind d-tag tombstones
-                // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_PERSONA, d_tag),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
-        )
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: persona-tombstone: {e}");
-    }
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let pubkey = scope.owner_keys.public_key().to_hex();
+    let event = build_persona_delete(d_tag, &pubkey)?
+        .sign_with_keys(&scope.owner_keys)
+        .map_err(|e| format!("failed to sign persona tombstone: {e}"))?;
+    let event_id = event.id.to_hex();
+    let raw_json = event.as_json();
+    let tombstone_d_tag = tombstone_retention_d_tag(KIND_PERSONA, d_tag);
+
+    let conn = open_retention_db(&scope.db_path)?;
+    // Purge the persona row first so an unpublished edit can never resurrect
+    // it after the tombstone publishes.
+    delete_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)?;
+
+    // B1 journal outbox: record immutable tombstone identity before retention.
+    let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
+    std::fs::create_dir_all(&anchor)
+        .map_err(|e| format!("create anchor dir for persona tombstone outbox: {e}"))?;
+    let journal = crate::managed_agents::store_journal::open_journal(&anchor)?;
+    let pub_op_id = crate::managed_agents::store_journal::new_operation_id();
+    crate::managed_agents::store_journal::insert_operation(
+        &journal,
+        &pub_op_id,
+        "tombstone",
+        d_tag,
+        crate::managed_agents::store_journal::Generation::zero(),
+    )?;
+
+    crate::managed_agents::store_journal::prepare_publication(
+        &journal,
+        &conn,
+        &pub_op_id,
+        &event_id,
+        &raw_json,
+        KIND_DELETE,
+        &pubkey,
+        &tombstone_d_tag,
+        &event.content,
+        event.created_at.as_secs() as i64,
+    )
 }
 
 #[cfg(test)]

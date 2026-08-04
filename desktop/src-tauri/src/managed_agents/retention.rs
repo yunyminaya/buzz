@@ -68,12 +68,17 @@ pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: 
 
 /// Snapshot the active relay + owner and resolve their durable event store.
 ///
-/// Callers keep the returned relay and keys alongside the path whenever work
-/// crosses an `.await`; a later workspace switch cannot retarget that work.
+/// On first use of the anchor-based path, migrates any existing retention DB
+/// from the old process-local path using SQLite backup semantics — inside the
+/// B1 advisory lock so concurrent first-boot processes serialize.  If migration
+/// fails we return `Err` (fail-closed: never fall back to the old per-process
+/// path, which would restore the split-authority condition B1 eliminates).
 pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<RetentionScope, String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
     let owner_keys = state.signing_keys()?;
-    let base_dir = super::managed_agents_base_dir(app)?;
+    // Use the B1 anchor directory so the retention DB lives alongside the journal
+    // and advisory lock.
+    let base_dir = crate::managed_agents::store_journal::store_anchor_dir(app)?;
     let db_path =
         scoped_retention_db_path(&base_dir, &relay_url, &owner_keys.public_key().to_hex());
     let parent = db_path
@@ -81,6 +86,63 @@ pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<Reten
         .ok_or_else(|| "retention scope path has no parent".to_string())?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create retention scope directory: {error}"))?;
+
+    // On first use of the anchor-based path, migrate from the old process-local
+    // path so no pending publications are silently dropped.
+    //
+    // Migration runs under the B1 advisory lock and uses SQLite's backup API to
+    // obtain a consistent copy even when the source WAL has unflushed pages.
+    // On any failure we return Err (fail-closed) — never fall back to the old
+    // process-local path.
+    if !db_path.exists() {
+        let old_base = super::managed_agents_base_dir(app)?;
+        let old_path =
+            scoped_retention_db_path(&old_base, &relay_url, &owner_keys.public_key().to_hex());
+        if old_path.exists() {
+            // Acquire the B1 advisory lock for the migration so two processes
+            // racing on first boot don't both try to copy simultaneously.
+            let _advisory =
+                crate::managed_agents::store_journal::JournalLockGuard::acquire(&base_dir)
+                    .map_err(|e| {
+                        format!("retention migration: cannot acquire advisory lock: {e}")
+                    })?;
+
+            // Re-check inside the lock: another process may have completed the
+            // migration while we were waiting.
+            if !db_path.exists() {
+                let stage_path = db_path.with_extension("db.stage");
+                // Open source and stage destination.
+                let src = rusqlite::Connection::open(&old_path)
+                    .map_err(|e| format!("retention migration: open source db: {e}"))?;
+                let mut dst = rusqlite::Connection::open(&stage_path)
+                    .map_err(|e| format!("retention migration: open stage db: {e}"))?;
+                // Use SQLite backup API — consistent even with live WAL.
+                {
+                    let backup = rusqlite::backup::Backup::new(&src, &mut dst)
+                        .map_err(|e| format!("retention migration: backup init: {e}"))?;
+                    backup
+                        .run_to_completion(5, std::time::Duration::from_millis(250), None)
+                        .map_err(|e| format!("retention migration: backup run: {e}"))?;
+                }
+                // Fsync the staged DB before rename.
+                dst.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .map_err(|e| format!("retention migration: checkpoint stage: {e}"))?;
+                drop(dst);
+                // Atomic rename stage → canonical.
+                std::fs::rename(&stage_path, &db_path).map_err(|e| {
+                    // Clean up stage on failure.
+                    let _ = std::fs::remove_file(&stage_path);
+                    format!("retention migration: rename stage → canonical: {e}")
+                })?;
+                eprintln!(
+                    "buzz-desktop: retention-migration: migrated {} → {}",
+                    old_path.display(),
+                    db_path.display()
+                );
+            }
+        }
+    }
+
     Ok(RetentionScope {
         db_path,
         relay_url,

@@ -77,7 +77,7 @@ fn strip_removes_the_baked_suffix_and_keeps_the_persona_body() {
     );
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     assert_eq!(
@@ -101,7 +101,7 @@ fn strip_splits_on_the_last_delimiter_occurrence() {
     );
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     assert_eq!(prompt_of(dir.path(), "Duncan").as_deref(), Some(&*quoted));
@@ -131,7 +131,7 @@ fn strip_leaves_near_miss_lookalikes_untouched() {
     let before = std::fs::read_to_string(base(dir.path()).join("managed-agents.json")).unwrap();
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0
     );
     let after = std::fs::read_to_string(base(dir.path()).join("managed-agents.json")).unwrap();
@@ -154,13 +154,13 @@ fn strip_is_a_no_op_on_the_second_run() {
     let path = base(dir.path()).join("managed-agents.json");
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     let after_first = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0,
         "second run finds nothing to strip"
     );
@@ -183,7 +183,7 @@ fn strip_preserves_every_other_field() {
     write_agents_json(dir.path(), &serde_json::json!([record]));
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     let stored = read_agents_json(dir.path()).remove(0);
@@ -211,7 +211,7 @@ fn strip_writes_a_backup_once_and_never_clobbers_it() {
     let bak = base(dir.path()).join("managed-agents.json.pre-team-suffix-strip.bak");
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     let bak_content = std::fs::read_to_string(&bak).unwrap();
@@ -226,7 +226,7 @@ fn strip_writes_a_backup_once_and_never_clobbers_it() {
         &serde_json::json!([agent_json("Alia", Some(&format!("Edited.{DELIMITER}new")))]),
     );
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     assert_eq!(
@@ -249,7 +249,7 @@ fn strip_nulls_a_prompt_that_was_only_the_baked_suffix() {
     );
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     assert!(
@@ -268,7 +268,7 @@ fn strip_skips_records_without_a_prompt() {
     let before = std::fs::read_to_string(base(dir.path()).join("managed-agents.json")).unwrap();
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0
     );
     assert_eq!(
@@ -282,7 +282,7 @@ fn strip_on_a_missing_store_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(base(dir.path())).unwrap();
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0
     );
 }
@@ -294,7 +294,8 @@ fn strip_on_an_unparseable_store_errors_without_writing() {
     let path = base(dir.path()).join("managed-agents.json");
     std::fs::write(&path, "{ not json").unwrap();
 
-    let err = strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap_err();
+    let err =
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap_err();
     assert!(err.contains("failed to parse"), "unexpected error: {err}");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -330,7 +331,7 @@ fn strip_repins_an_instance_that_was_current_before_the_strip() {
     );
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         2
     );
 
@@ -364,7 +365,7 @@ fn strip_leaves_an_already_drifted_instance_pin_alone() {
     );
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         2
     );
 
@@ -394,7 +395,7 @@ fn strip_creates_the_backup_owner_only() {
     write_agents_json(dir.path(), &serde_json::json!([record]));
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(dir.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
 
@@ -429,7 +430,8 @@ fn strip_backs_up_beside_the_symlink_target() {
     .unwrap();
 
     assert_eq!(
-        strip_baked_team_instructions_in_dir(&base(worktree.path())).unwrap(),
+        strip_baked_team_instructions_in_dir(&base(worktree.path()), &base(worktree.path()))
+            .unwrap(),
         1
     );
 

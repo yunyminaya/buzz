@@ -150,7 +150,7 @@ fn failing_save_is_retry_safe() {
     ];
     let cascade: HashSet<String> = ["pk-a".to_string(), "pk-b".to_string()].into();
 
-    let result = commit_cascade_agents(&mut agents, &cascade, |_| {
+    let result: Result<(), _> = commit_cascade_agents(&mut agents, &cascade, |_| {
         Err("simulated disk failure".to_string())
     });
 

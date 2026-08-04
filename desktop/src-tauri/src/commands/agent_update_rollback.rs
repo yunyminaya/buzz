@@ -2,9 +2,7 @@ use tauri::AppHandle;
 
 use crate::{
     app_state::AppState,
-    managed_agents::{
-        load_managed_agents, save_managed_agents, try_regenerate_nest, ManagedAgentRecord,
-    },
+    managed_agents::{mutate_agent_store, try_regenerate_nest, ManagedAgentRecord},
 };
 
 #[derive(Debug)]
@@ -79,18 +77,24 @@ pub(super) fn rollback_failed_agent_update(
     rollback: AgentUpdateRollback,
 ) -> Result<(), String> {
     {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(app)?;
-        restore_agent_update(&mut records, pubkey, rollback)?;
-        save_managed_agents(app, &records)?;
-        let restored = records
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found after failed rename rollback"))?;
-        super::agents::retain_managed_agent_pending(app, state, restored);
+        let pubkey = pubkey.to_owned();
+        let (restored, _guard) =
+            mutate_agent_store(app, store_guard, move |mut instances, _journal| {
+                restore_agent_update(&mut instances, &pubkey, rollback)?;
+                let restored = instances
+                    .iter()
+                    .find(|r| r.pubkey == pubkey)
+                    .ok_or_else(|| {
+                        format!("agent {pubkey} not found after failed rename rollback")
+                    })?
+                    .clone();
+                Ok((instances, restored))
+            })?;
+        super::agents::retain_managed_agent_pending(app, state, &restored, None);
     }
     try_regenerate_nest(app);
     Ok(())

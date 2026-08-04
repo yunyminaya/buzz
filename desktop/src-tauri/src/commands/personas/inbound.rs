@@ -7,9 +7,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        agent_events::ManagedAgentEventContent, load_personas, persona_events::persona_d_tag,
-        save_personas, team_events::TeamEventContent, try_regenerate_nest, AgentDefinition,
-        ManagedAgentRecord, TeamRecord,
+        agent_events::ManagedAgentEventContent, persona_events::persona_d_tag,
+        team_events::TeamEventContent, try_regenerate_nest, AgentDefinition, ManagedAgentRecord,
+        TeamRecord,
     },
     util::now_iso,
 };
@@ -71,10 +71,10 @@ fn reconcile_inbound_persona_event_blocking(
 ) -> Result<(), String> {
     use crate::managed_agents::{
         agent_events::managed_agent_content_from_event,
-        load_managed_agents, load_teams,
+        mutate_agent_store, mutate_persona_store,
         persona_events::persona_from_event,
         retention::{open_retention_db, retain_inbound_event, InboundOutcome, RetainedEvent},
-        save_managed_agents, save_teams,
+        storage::mutate_team_store,
         team_events::team_content_from_event,
     };
     use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
@@ -113,7 +113,7 @@ fn reconcile_inbound_persona_event_blocking(
         None => event_d_tag(&event)?,
     };
 
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -149,27 +149,27 @@ fn reconcile_inbound_persona_event_blocking(
 
     match kind {
         KIND_PERSONA => {
-            let mut personas = load_personas(&app)?;
-            // `inbound_persona` is `Some` for KIND_PERSONA (set above).
-            apply_inbound_persona(
-                &mut personas,
-                inbound_persona.expect("persona parsed above"),
-            );
-            save_personas(&app, &personas)?;
+            let inbound_def = inbound_persona.expect("persona parsed above");
+            let ((), _guard) = mutate_persona_store(&app, store_guard, move |mut defs| {
+                apply_inbound_persona(&mut defs, inbound_def);
+                Ok((defs, ()))
+            })?;
         }
         KIND_TEAM => {
-            let mut teams = load_teams(&app)?;
-            apply_inbound_team(&mut teams, d_tag, team_content_from_event(&event)?);
-            save_teams(&app, &teams)?;
+            let d_tag_for_closure = d_tag.clone();
+            let team_content = team_content_from_event(&event)?;
+            let ((), _guard) = mutate_team_store(&app, store_guard, move |mut teams, _journal| {
+                apply_inbound_team(&mut teams, d_tag_for_closure, team_content);
+                Ok((teams, ()))
+            })?;
         }
         KIND_MANAGED_AGENT => {
-            let mut agents = load_managed_agents(&app)?;
-            apply_inbound_managed_agent(
-                &mut agents,
-                &d_tag,
-                managed_agent_content_from_event(&event)?,
-            );
-            save_managed_agents(&app, &agents)?;
+            let d_tag_for_closure = d_tag.clone();
+            let content = managed_agent_content_from_event(&event)?;
+            let ((), _guard) = mutate_agent_store(&app, store_guard, move |mut instances, _j| {
+                apply_inbound_managed_agent(&mut instances, &d_tag_for_closure, content);
+                Ok((instances, ()))
+            })?;
         }
         _ => unreachable!("kind gated above"),
     }
@@ -237,12 +237,12 @@ fn reconcile_inbound_tombstone(
     state: &AppState,
 ) -> Result<(), String> {
     use crate::managed_agents::{
-        load_managed_agents, load_teams,
+        mutate_agent_store, mutate_persona_store,
         retention::{
             open_retention_db, retain_inbound_event, tombstone_retention_d_tag, InboundOutcome,
             RetainedEvent,
         },
-        save_managed_agents, save_teams,
+        storage::mutate_team_store,
     };
     use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
     use nostr::JsonUtil;
@@ -254,7 +254,7 @@ fn reconcile_inbound_tombstone(
         return Ok(()); // deletion for a kind we don't track locally
     }
 
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
@@ -290,19 +290,25 @@ fn reconcile_inbound_tombstone(
     // use: persona by `persona_d_tag`, team by `id`, managed-agent by `pubkey`.
     match target_kind {
         KIND_PERSONA => {
-            let mut personas = load_personas(app)?;
-            personas.retain(|record| persona_d_tag(record) != target_d_tag);
-            save_personas(app, &personas)?;
+            let target_d_tag_for_closure = target_d_tag.clone();
+            let ((), _guard) = mutate_persona_store(app, store_guard, move |mut defs| {
+                defs.retain(|record| persona_d_tag(record) != target_d_tag_for_closure);
+                Ok((defs, ()))
+            })?;
         }
         KIND_TEAM => {
-            let mut teams = load_teams(app)?;
-            teams.retain(|record| record.id != target_d_tag);
-            save_teams(app, &teams)?;
+            let target_d_tag_for_closure = target_d_tag.clone();
+            let ((), _guard) = mutate_team_store(app, store_guard, move |mut teams, _journal| {
+                teams.retain(|record| record.id != target_d_tag_for_closure);
+                Ok((teams, ()))
+            })?;
         }
         KIND_MANAGED_AGENT => {
-            let mut agents = load_managed_agents(app)?;
-            agents.retain(|record| record.pubkey != target_d_tag);
-            save_managed_agents(app, &agents)?;
+            let target_d_tag_for_closure = target_d_tag.clone();
+            let ((), _guard) = mutate_agent_store(app, store_guard, move |mut instances, _j| {
+                instances.retain(|record| record.pubkey != target_d_tag_for_closure);
+                Ok((instances, ()))
+            })?;
         }
         _ => unreachable!("target kind gated above"),
     }

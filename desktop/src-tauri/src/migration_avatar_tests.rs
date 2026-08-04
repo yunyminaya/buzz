@@ -114,8 +114,17 @@ fn refresh_builtin_agent_avatars_updates_seeded_values_and_preserves_customizati
     assert_eq!(migrated[0]["avatar_url"], new_fizz);
     assert_eq!(migrated[0]["updated_at"], "after");
     assert_eq!(migrated[0]["future_definition_field"], "preserved");
+    // Strip the unknown future field before typed deserialization — the
+    // presence is already verified above; ManagedAgentRecord uses deny_unknown_fields
+    // to catch corrupt data, so unknown fields from a *future* schema version
+    // must be checked at the JSON level and stripped before struct decode.
+    let mut def_value = migrated[0].clone();
+    def_value
+        .as_object_mut()
+        .unwrap()
+        .remove("future_definition_field");
     let migrated_definition: crate::managed_agents::ManagedAgentRecord =
-        serde_json::from_value(migrated[0].clone()).unwrap();
+        serde_json::from_value(def_value).unwrap();
     let new_persona_version = crate::managed_agents::persona_events::persona_content_hash(
         &crate::managed_agents::persona_events::persona_event_content(
             &migrated_definition.to_definition_view().unwrap(),

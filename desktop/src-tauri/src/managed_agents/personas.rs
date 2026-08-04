@@ -326,6 +326,7 @@ pub fn validate_persona_activation_change(
 }
 
 pub fn load_personas(app: &AppHandle) -> Result<Vec<AgentDefinition>, String> {
+    use tauri::Manager;
     let now = now_iso();
 
     // Post-fold: definitions live in the unified agent store, presented in
@@ -339,7 +340,26 @@ pub fn load_personas(app: &AppHandle) -> Result<Vec<AgentDefinition>, String> {
 
     let (records, changed) = merge_personas(records, &now);
     if changed {
-        save_personas(app, &records)?;
+        // Merge write-back: hold the mutex across the write so no racing
+        // reader can see the pre-merge state, and so the write goes through
+        // mutate_store (fresh-decode → merge → atomic file commit).
+        let state = app.state::<crate::app_state::AppState>();
+        let guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| format!("failed to acquire store lock in load_personas merge: {e}"))?;
+        // Re-merge from a fresh decode inside the closure so concurrent writes
+        // between our load and now are incorporated rather than overwritten.
+        let merged = records.clone();
+        let now_for_closure = now.clone();
+        let (merged_result, _guard) = mutate_persona_store(app, guard, move |fresh_defs| {
+            let (re_merged, _) = merge_personas(fresh_defs, &now_for_closure);
+            // If the initial merge included the caller's `merged` records,
+            // use the fresh re-merge so we don't clobber concurrent writes.
+            let _ = merged; // capture but use fresh
+            Ok((re_merged.clone(), re_merged))
+        })?;
+        return Ok(merged_result);
     }
 
     Ok(records)
@@ -363,17 +383,51 @@ pub(crate) fn load_personas_from_path(
         .map_err(|error| format!("failed to parse persona store: {error}"))
 }
 
-pub fn save_personas(app: &AppHandle, records: &[AgentDefinition]) -> Result<(), String> {
-    let mut sorted = records.to_vec();
-    sort_personas(&mut sorted);
+/// Atomically mutate the persona **definition** half of the agent store via a
+/// closure, holding the OS advisory lock across fresh-decode → mutation → write.
+///
+/// The closure receives the current persona list (decoded from the unified store
+/// and presented in the legacy `AgentDefinition` shape).  The instance half is
+/// preserved automatically.  Returns `(T, guard)` so post-write work can run
+/// inside the in-process lock.
+pub(crate) fn mutate_persona_store<'g, F, T>(
+    app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    mutation: F,
+) -> Result<(T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(Vec<AgentDefinition>) -> Result<(Vec<AgentDefinition>, T), String>,
+{
+    crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+        // Present definitions in the legacy AgentDefinition shape.
+        let defs: Vec<AgentDefinition> = st
+            .agents
+            .iter()
+            .filter(|r| r.pubkey.is_empty())
+            .filter_map(|r| r.to_definition_view())
+            .collect();
 
-    // Post-fold: persona saves write key-less definition records into the
-    // unified agent store (instances preserved by `save_agent_definitions`).
-    let definitions: Vec<_> = sorted
-        .into_iter()
-        .map(|persona| persona.into_agent_record())
-        .collect();
-    crate::managed_agents::storage::save_agent_definitions(app, &definitions)
+        // Preserve the instance half.
+        let instances: Vec<crate::managed_agents::ManagedAgentRecord> = st
+            .agents
+            .into_iter()
+            .filter(|r| !r.pubkey.is_empty())
+            .collect();
+        let teams = st.teams;
+
+        let (mut new_defs, result) = mutation(defs)?;
+        sort_personas(&mut new_defs);
+
+        let mut all: Vec<crate::managed_agents::ManagedAgentRecord> = new_defs
+            .into_iter()
+            .map(|p| p.into_agent_record())
+            .collect();
+        // Sort definitions by slug before instances.
+        all.sort_by(|a, b| a.slug.cmp(&b.slug));
+        all.extend(instances);
+
+        Ok((all, teams, result))
+    })
 }
 
 #[cfg(test)]

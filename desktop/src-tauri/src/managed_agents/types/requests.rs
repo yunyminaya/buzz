@@ -17,7 +17,7 @@ use super::{
 /// a stored behavior group on every team-import edit. Absent group = don't touch the
 /// stored behavior group; present group = validate and replace the fields as a unit
 /// (mode and allowlist must travel together).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonaBehaviorRequest {
     #[serde(default)]

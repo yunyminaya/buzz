@@ -35,7 +35,14 @@ pub fn backfill_standalone_agents(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;
     };
-    match backfill_standalone_agents_in_dir(&base_dir) {
+    let anchor = match crate::managed_agents::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: standalone-backfill: failed to resolve anchor: {e}");
+            return;
+        }
+    };
+    match backfill_standalone_agents_in_dir(&base_dir, &anchor) {
         Ok(0) => {}
         Ok(backfilled) => {
             eprintln!(
@@ -48,15 +55,22 @@ pub fn backfill_standalone_agents(app: &tauri::AppHandle) {
 
 /// Core backfill logic, decoupled from the Tauri `AppHandle` for testing.
 /// Returns the number of records backfilled (0 = nothing to do).
-fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
+fn backfill_standalone_agents_in_dir(base_dir: &Path, anchor: &Path) -> Result<usize, String> {
     let agents_path = base_dir.join("managed-agents.json");
     if !agents_path.exists() {
         return Ok(0);
     }
+
+    // Acquire the B1 advisory lock so this migration write is serialized
+    // against any concurrent process that may be reading or writing the store.
+    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(anchor)?;
+
     let content = std::fs::read_to_string(&agents_path)
         .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
-    let mut all: Vec<ManagedAgentRecord> = serde_json::from_str(&content)
-        .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?;
+    // Fail-closed codec: unknown/malformed content ⇒ error, zero mutation.
+    let mut all: Vec<ManagedAgentRecord> =
+        crate::managed_agents::store_journal::decode_agent_store(content.as_bytes())
+            .map_err(|e| e.message)?;
 
     let needs_backfill =
         |record: &ManagedAgentRecord| !record.pubkey.is_empty() && record.persona_id.is_none();
@@ -131,7 +145,10 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
     all.extend(manufactured);
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|e| format!("failed to serialize unified store: {e}"))?;
-    crate::managed_agents::atomic_write_json_restricted(&agents_path, &payload)?;
+    crate::managed_agents::store_journal::atomic_write_restricted_with_fsync(
+        &agents_path,
+        &payload,
+    )?;
     Ok(backfilled)
 }
 

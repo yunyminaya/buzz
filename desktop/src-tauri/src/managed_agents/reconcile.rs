@@ -37,11 +37,29 @@ pub(crate) fn reconcile_agents_to_events(
     keys: &nostr::Keys,
     db_path: &Path,
 ) {
-    let Ok(base_dir) = super::managed_agents_base_dir(app) else {
-        return;
+    // Use the anchor dir for both lock and file path (fail-closed on lock failure).
+    let anchor = match super::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: agent-event-reconcile: anchor resolution failed: {e}");
+            return;
+        }
     };
 
-    match reconcile_agents_in_dir_at(&base_dir, keys, db_path) {
+    // Acquire the B1 advisory lock. Fail-closed: skip the reconcile if we
+    // cannot acquire the lock rather than reading stale/wrong-path files.
+    let _advisory = match super::store_journal::JournalLockGuard::acquire(&anchor) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: agent-event-reconcile: advisory lock failed — \
+                 skipping reconcile: {e}"
+            );
+            return;
+        }
+    };
+
+    match reconcile_agents_in_dir_at(&anchor, keys, db_path) {
         Ok(0) => {}
         Ok(reconciled) => {
             eprintln!(
@@ -83,10 +101,17 @@ fn reconcile_agents_in_dir_at(
     let content = std::fs::read_to_string(&store_path)
         .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
 
-    let records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
-        super::storage::backup_invalid_store(&store_path);
-        format!("failed to parse managed-agents.json (preserved as .invalid): {e}")
-    })?;
+    // Fail-closed codec: unknown/malformed content ⇒ error, zero mutation.
+    let records: Vec<ManagedAgentRecord> =
+        crate::managed_agents::store_journal::decode_agent_store(content.as_bytes()).map_err(
+            |e| {
+                super::storage::backup_invalid_store(&store_path);
+                format!(
+                    "failed to parse managed-agents.json (preserved as .invalid): {}",
+                    e.message
+                )
+            },
+        )?;
 
     if records.is_empty() {
         return Ok(0);
@@ -104,7 +129,7 @@ fn reconcile_agents_in_dir_at(
             continue;
         }
 
-        if retain_agent_record(&conn, keys, record)? {
+        if retain_agent_record(&conn, keys, record)?.is_some() {
             reconciled += 1;
         }
     }
@@ -122,11 +147,16 @@ fn reconcile_agents_in_dir_at(
 /// (`retain_managed_agent_pending`, persona-rename propagation). Every
 /// mutation of an agent's published identity must go through it so the
 /// retained record can never silently drift from `managed-agents.json`.
+///
+/// Returns `Some((event_id, raw_json))` when a new event was retained (content
+/// changed or first write), `None` when the agent was a no-op (unchanged
+/// content). Callers that record outbox entries in the B1 journal use the
+/// returned identity to call `insert_outbox_event` before the relay publish.
 pub(crate) fn retain_agent_record(
     conn: &rusqlite::Connection,
     keys: &nostr::Keys,
     record: &ManagedAgentRecord,
-) -> Result<bool, String> {
+) -> Result<Option<(String, String)>, String> {
     let owner_pubkey = keys.public_key().to_hex();
     let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
 
@@ -146,8 +176,11 @@ pub(crate) fn retain_agent_record(
 
     let content = event.content.clone();
     if existing.as_ref().is_some_and(|row| row.content == content) {
-        return Ok(false);
+        return Ok(None);
     }
+
+    let event_id = event.id.to_hex();
+    let raw_json = event.as_json();
 
     retain_event(
         conn,
@@ -157,12 +190,45 @@ pub(crate) fn retain_agent_record(
             d_tag: record.pubkey.clone(),
             content,
             created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
+            raw_event: raw_json.clone(),
             pending_sync: true,
         },
     )
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
-    Ok(true)
+    Ok(Some((event_id, raw_json)))
+}
+
+/// Build the kind:30177 event for `record` and compare it against the
+/// retained head, WITHOUT writing to the retention DB.
+///
+/// Returns `Some((event, owner_pubkey))` when the content has changed or
+/// there is no retained head — i.e. a new row is needed.  Returns `None`
+/// when the retained content already matches (true no-op).
+///
+/// Callers pass the returned event identity to
+/// [`crate::managed_agents::store_journal::prepare_publication`], which
+/// atomically records outbox evidence and the retention row.
+pub(crate) fn build_agent_event_if_changed(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    record: &ManagedAgentRecord,
+) -> Result<Option<(nostr::Event, String)>, String> {
+    let owner_pubkey = keys.public_key().to_hex();
+    let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
+
+    let event = build_agent_event(record)?
+        .custom_created_at(monotonic_created_at(
+            existing.as_ref().map(|row| row.created_at),
+        ))
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign event for '{}': {e}", record.name))?;
+
+    let content = event.content.clone();
+    if existing.as_ref().is_some_and(|row| row.content == content) {
+        return Ok(None);
+    }
+
+    Ok(Some((event, owner_pubkey)))
 }
 
 #[cfg(test)]

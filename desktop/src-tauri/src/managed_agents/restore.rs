@@ -1,7 +1,6 @@
 use super::{
-    find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agents, load_personas,
-    save_managed_agents, spawn_agent_child, sync_managed_agent_processes, BackendKind,
-    ManagedAgentProcess,
+    find_managed_agent_mut, kill_stale_tracked_processes, load_personas, mutate_agent_store,
+    spawn_agent_child, sync_managed_agent_processes, BackendKind, ManagedAgentProcess,
 };
 use crate::app_state::AppState;
 use crate::util;
@@ -41,48 +40,41 @@ type AgentSpawnResult = (String, SpawnOutcome);
 /// `effective_config::resolve_effective_config`'s `OrphanedInstance` arm).
 pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
-
-    let mut records = load_managed_agents(app)?;
-    let needs_backfill = records
-        .iter()
-        .any(|r| r.persona_id.is_some() && r.persona_source_version.is_none());
-    if !needs_backfill {
-        return Ok(());
-    }
-
     let personas = load_personas(app)?;
-    let mut changed = false;
-    for record in records.iter_mut() {
-        let Some(persona_id) = record.persona_id.clone() else {
-            continue;
-        };
-        if record.persona_source_version.is_some() {
-            continue;
-        }
-        let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
-            eprintln!(
-                "buzz-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving it orphaned — spawn will refuse it",
-                record.pubkey
-            );
-            continue;
-        };
-        // Layer precedence at read time: persona env < agent env. When the
-        // persona leaves model/provider blank, the record's own configured
-        // values are preserved — a blank persona must not clobber a
-        // user-configured agent. See `apply_persona_snapshot`.
-        super::persona_events::apply_persona_snapshot(record, persona);
-        record.updated_at = util::now_iso();
-        changed = true;
-    }
 
-    if changed {
-        save_managed_agents(app, &records)?;
-    }
-    Ok(())
+    mutate_agent_store(app, store_guard, move |mut records, _journal| {
+        let needs_backfill = records
+            .iter()
+            .any(|r| r.persona_id.is_some() && r.persona_source_version.is_none());
+        if !needs_backfill {
+            return Ok((records, ()));
+        }
+
+        for record in records.iter_mut() {
+            let Some(persona_id) = record.persona_id.clone() else {
+                continue;
+            };
+            if record.persona_source_version.is_some() {
+                continue;
+            }
+            let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
+                eprintln!(
+                    "buzz-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving it orphaned — spawn will refuse it",
+                    record.pubkey
+                );
+                continue;
+            };
+            super::persona_events::apply_persona_snapshot(record, persona);
+            record.updated_at = util::now_iso();
+        }
+
+        Ok((records, ()))
+    })
+    .map(|_| ())
 }
 
 /// Restore managed agents that were running before the app was closed.
@@ -102,9 +94,9 @@ pub async fn restore_managed_agents_on_launch(
     let state = app.state::<AppState>();
 
     // ── Phase A (under lock): housekeeping + collect agents to restore ──
-    let mut agents_to_start: Vec<super::ManagedAgentRecord>;
+    let agents_to_start: Vec<super::ManagedAgentRecord>;
     {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
@@ -113,117 +105,96 @@ pub async fn restore_managed_agents_on_launch(
             return Ok(());
         }
 
-        let mut records = load_managed_agents(app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|error| error.to_string())?;
-        let (mut changed, _exited) = sync_managed_agent_processes(
-            &mut records,
-            &mut runtimes,
-            &super::current_instance_id(app),
-        );
-        changed |=
-            kill_stale_tracked_processes(&mut records, &runtimes, &super::current_instance_id(app));
+        let instance_id = super::current_instance_id(app);
 
-        let tracked_pids: Vec<u32> = runtimes
-            .values()
-            .map(|runtime| runtime.child.id())
-            .chain(
-                super::read_all_agent_runtime_receipts(app)
-                    .into_iter()
-                    .filter_map(|(path, receipt)| {
-                        super::valid_agent_runtime_receipt(
-                            &path,
-                            &receipt,
-                            &super::current_instance_id(app),
-                        )
-                        .then_some(receipt.pid)
-                    }),
-            )
-            .collect();
-        super::sweep_orphaned_agent_processes(app, &tracked_pids);
+        let (to_start_out, _guard) =
+            mutate_agent_store(app, store_guard, |mut records, _journal| {
+                let (mut changed, _exited) =
+                    sync_managed_agent_processes(&mut records, &mut runtimes, &instance_id);
+                changed |= kill_stale_tracked_processes(&mut records, &runtimes, &instance_id);
 
-        // System-wide sweep: enumerate all user processes and kill any known
-        // agent binaries not tracked by this session. Catches orphans whose
-        // PID files were already cleaned up (e.g. agent workers in their own
-        // process group whose parent harness exited).
-        super::sweep_system_agent_processes(&super::current_instance_id(app), &tracked_pids);
+                let tracked_pids: Vec<u32> = runtimes
+                    .values()
+                    .map(|runtime| runtime.child.id())
+                    .chain(
+                        super::read_all_agent_runtime_receipts(app)
+                            .into_iter()
+                            .filter_map(|(path, receipt)| {
+                                super::valid_agent_runtime_receipt(&path, &receipt, &instance_id)
+                                    .then_some(receipt.pid)
+                            }),
+                    )
+                    .collect();
+                super::sweep_orphaned_agent_processes(app, &tracked_pids);
+                super::sweep_system_agent_processes(&instance_id, &tracked_pids);
+                super::reap_dead_instance_agents(&instance_id, &tracked_pids);
+                super::sweep_untracked_bundle_harnesses(&tracked_pids);
 
-        // Dead-instance reaping: find agents belonging to Buzz instances
-        // whose desktop process is no longer running and reap them.
-        super::reap_dead_instance_agents(&super::current_instance_id(app), &tracked_pids);
+                let candidates: Vec<String> = records
+                    .iter()
+                    .filter(|record| {
+                        record.start_on_app_launch && record.backend == BackendKind::Local
+                    })
+                    .map(|record| record.pubkey.clone())
+                    .collect();
 
-        // Exact-path sweep: kill any buzz-acp process whose executable path
-        // matches this bundle's harness binary but is not in the tracked set.
-        // Complements the env-var sweep above — catches orphans that predate
-        // BUZZ_MANAGED_AGENT injection or lost their PID-file receipt.
-        //
-        // TODO: the three sweeps above each walk the PID table independently.
-        // A future consolidation should collect a single shared process snapshot
-        // at the top of this block and thread it through all sweep functions,
-        // replacing the three separate kernel enumerations.
-        super::sweep_untracked_bundle_harnesses(&tracked_pids);
-
-        let candidates: Vec<String> = records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
-            .map(|record| record.pubkey.clone())
-            .collect();
-
-        let mut to_start = Vec::new();
-        for pubkey in &candidates {
-            if let Some(runtime) = runtimes
-                .iter_mut()
-                .find(|(key, _)| key.pubkey == *pubkey)
-                .map(|(_, runtime)| runtime)
-            {
-                if runtime.child.try_wait().ok().flatten().is_none() {
-                    continue;
-                }
-            }
-            if let Some(record) = records.iter().find(|r| r.pubkey == *pubkey) {
-                if let Some(pid) = record.runtime_pid {
-                    if super::process_is_running(pid) {
-                        continue;
+                let mut to_start = Vec::new();
+                for pubkey in &candidates {
+                    if let Some(runtime) = runtimes
+                        .iter_mut()
+                        .find(|(key, _)| key.pubkey == *pubkey)
+                        .map(|(_, runtime)| runtime)
+                    {
+                        if runtime.child.try_wait().ok().flatten().is_none() {
+                            continue;
+                        }
+                    }
+                    if let Some(record) = records.iter().find(|r| r.pubkey == *pubkey) {
+                        if let Some(pid) = record.runtime_pid {
+                            if super::process_is_running(pid) {
+                                continue;
+                            }
+                        }
+                        to_start.push(record.clone());
                     }
                 }
-                to_start.push(record.clone());
-            }
-        }
-        agents_to_start = to_start;
+                let agents_to_start_inner = to_start;
 
-        // Re-snapshot persona config for agents about to be restored, matching
-        // the interactive spawn path so auto-start agents also pick up the
-        // current persona on app launch.
-        let personas_for_snapshot = super::load_personas(app).unwrap_or_default();
-        for record in records.iter_mut() {
-            if !agents_to_start.iter().any(|r| r.pubkey == record.pubkey) {
-                continue;
-            }
-            let Some(persona_id) = record.persona_id.clone() else {
-                continue;
-            };
-            let Some(persona) = personas_for_snapshot.iter().find(|p| p.id == persona_id) else {
-                // Orphaned: no current persona to re-snapshot from. Leave the
-                // record as-is — `spawn_agent_child` (Phase B below) refuses to
-                // spawn it and Phase C persists the refusal to `last_error`.
-                continue;
-            };
-            super::persona_events::apply_persona_snapshot(record, persona);
-            record.updated_at = util::now_iso();
-            changed = true;
-        }
-        // Re-collect to_start from the updated records so Phase B spawns the refreshed config.
-        agents_to_start = records
-            .iter()
-            .filter(|r| agents_to_start.iter().any(|s| s.pubkey == r.pubkey))
-            .cloned()
-            .collect();
+                // Re-snapshot persona config for agents about to be restored.
+                let personas_for_snapshot = super::load_personas(app).unwrap_or_default();
+                for record in records.iter_mut() {
+                    if !agents_to_start_inner
+                        .iter()
+                        .any(|r| r.pubkey == record.pubkey)
+                    {
+                        continue;
+                    }
+                    let Some(persona_id) = record.persona_id.clone() else {
+                        continue;
+                    };
+                    let Some(persona) = personas_for_snapshot.iter().find(|p| p.id == persona_id)
+                    else {
+                        continue;
+                    };
+                    super::persona_events::apply_persona_snapshot(record, persona);
+                    record.updated_at = util::now_iso();
+                    changed = true;
+                }
+                // Re-collect from updated records so Phase B spawns the refreshed config.
+                let agents_to_start_refreshed: Vec<_> = records
+                    .iter()
+                    .filter(|r| agents_to_start_inner.iter().any(|s| s.pubkey == r.pubkey))
+                    .cloned()
+                    .collect();
 
-        if changed {
-            save_managed_agents(app, &records)?;
-        }
+                let _ = changed;
+                Ok((records, agents_to_start_refreshed))
+            })?;
+        agents_to_start = to_start_out;
     }
 
     if agents_to_start.is_empty() {
@@ -363,94 +334,95 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase C (re-acquire lock): write back PIDs and status to records ──
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
-    let mut records = load_managed_agents(app)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|error| error.to_string())?;
 
-    let mut successfully_spawned: Vec<String> = Vec::new();
-
-    for (pubkey, outcome) in spawn_results {
-        match outcome {
-            // Skipped means a concurrent reconcile already owns a live child for
-            // this pair; leave its runtime and record state untouched.
-            SpawnOutcome::Skipped => continue,
-            SpawnOutcome::Spawned(key, mut process) => {
-                let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
-                    continue;
-                };
-                let now = util::now_iso();
-                let receipt = super::ManagedAgentRuntimeReceipt {
-                    key: key.clone(),
-                    pid: process.child.id(),
-                    desktop_instance_id: super::current_instance_id(app),
-                    started_at: now.clone(),
-                };
-                if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
-                    let _ = super::terminate_process(process.child.id());
-                    let _ = process.child.wait();
-                    record.updated_at = now;
-                    record.last_error = Some(error);
-                    continue;
-                }
-                record.updated_at = now.clone();
-                record.runtime_pid = None;
-                record.last_started_at = Some(now);
-                record.last_stopped_at = None;
-                record.last_exit_code = None;
-                record.last_error = None;
-                runtimes.insert(key, super::ManagedAgentPairRuntime::starting(*process));
-                successfully_spawned.push(pubkey);
-            }
-            SpawnOutcome::Failed(error) => {
-                let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
-                    continue;
-                };
-                record.updated_at = util::now_iso();
-                record.last_error = Some(error);
-            }
-        }
-    }
-
-    // Collect profile reconciliation data for successfully spawned agents before
-    // releasing the lock. This mirrors the fire-and-forget pattern in
-    // start_managed_agent — ensuring boot-restored agents get the same profile
-    // self-healing as UI-started agents.
+    // Load personas before the closure to avoid disk I/O inside the OS lock.
     let reconcile_personas = super::load_personas(app).unwrap_or_default();
-    let reconcile_items: Vec<(String, crate::commands::ProfileReconcileData)> =
-        successfully_spawned
-            .iter()
-            .filter_map(|pubkey| {
-                let record = records.iter().find(|r| r.pubkey == *pubkey)?;
-                // Resolve the effective harness for the avatar-fallback
-                // derivation (the snapshot may be empty/stale for an inherited
-                // harness). Mirrors the UI start path.
-                let effective_command =
-                    crate::managed_agents::record_agent_command(record, &reconcile_personas);
-                Some((
-                    pubkey.clone(),
-                    crate::commands::ProfileReconcileData {
-                        private_key_nsec: record.private_key_nsec.clone(),
-                        name: record.name.clone(),
-                        relay_url: record.relay_url.clone(),
-                        avatar_url: record.avatar_url.clone(),
-                        auth_tag: record.auth_tag.clone(),
-                        pubkey: record.pubkey.clone(),
-                        agent_command: effective_command,
-                        persona_id: record.persona_id.clone(),
-                    },
-                ))
-            })
-            .collect();
+    let reconcile_personas_for_closure = reconcile_personas.clone();
 
-    save_managed_agents(app, &records)?;
-    drop(runtimes);
-    drop(_store_guard);
+    let (reconcile_items, store_guard_after) =
+        mutate_agent_store(app, store_guard, move |mut instances, _journal| {
+            let mut successfully_spawned: Vec<String> = Vec::new();
+
+            for (pubkey, outcome) in spawn_results {
+                match outcome {
+                    // Skipped means a concurrent reconcile already owns a live child for
+                    // this pair; leave its runtime and record state untouched.
+                    SpawnOutcome::Skipped => continue,
+                    SpawnOutcome::Spawned(key, mut process) => {
+                        let Ok(record) = find_managed_agent_mut(&mut instances, &pubkey) else {
+                            continue;
+                        };
+                        let now = util::now_iso();
+                        let receipt = super::ManagedAgentRuntimeReceipt {
+                            key: key.clone(),
+                            pid: process.child.id(),
+                            desktop_instance_id: super::current_instance_id(app),
+                            started_at: now.clone(),
+                        };
+                        if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
+                            let _ = super::terminate_process(process.child.id());
+                            let _ = process.child.wait();
+                            record.updated_at = now;
+                            record.last_error = Some(error);
+                            continue;
+                        }
+                        record.updated_at = now.clone();
+                        record.runtime_pid = None;
+                        record.last_started_at = Some(now);
+                        record.last_stopped_at = None;
+                        record.last_exit_code = None;
+                        record.last_error = None;
+                        runtimes.insert(key, super::ManagedAgentPairRuntime::starting(*process));
+                        successfully_spawned.push(pubkey);
+                    }
+                    SpawnOutcome::Failed(error) => {
+                        let Ok(record) = find_managed_agent_mut(&mut instances, &pubkey) else {
+                            continue;
+                        };
+                        record.updated_at = util::now_iso();
+                        record.last_error = Some(error);
+                    }
+                }
+            }
+
+            // Collect profile reconciliation data before releasing the lock.
+            let reconcile_items: Vec<(String, crate::commands::ProfileReconcileData)> =
+                successfully_spawned
+                    .iter()
+                    .filter_map(|pubkey| {
+                        let record = instances.iter().find(|r| r.pubkey == *pubkey)?;
+                        let effective_command = crate::managed_agents::record_agent_command(
+                            record,
+                            &reconcile_personas_for_closure,
+                        );
+                        Some((
+                            pubkey.clone(),
+                            crate::commands::ProfileReconcileData {
+                                private_key_nsec: record.private_key_nsec.clone(),
+                                name: record.name.clone(),
+                                relay_url: record.relay_url.clone(),
+                                avatar_url: record.avatar_url.clone(),
+                                auth_tag: record.auth_tag.clone(),
+                                pubkey: record.pubkey.clone(),
+                                agent_command: effective_command,
+                                persona_id: record.persona_id.clone(),
+                            },
+                        ))
+                    })
+                    .collect();
+
+            Ok((instances, reconcile_items))
+        })?;
+
+    drop(store_guard_after);
     drop(restore_transition);
 
     // ── Profile reconciliation (fire-and-forget) ────────────────────────────
@@ -479,13 +451,16 @@ fn persist_restore_error(
     pubkey: &str,
     error: String,
 ) -> Result<(), String> {
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
-    let mut records = load_managed_agents(app)?;
-    let record = find_managed_agent_mut(&mut records, pubkey)?;
-    record.updated_at = util::now_iso();
-    record.last_error = Some(error);
-    save_managed_agents(app, &records)
+    let pubkey = pubkey.to_owned();
+    crate::managed_agents::mutate_agent_store(app, store_guard, move |mut instances, _journal| {
+        let record = crate::managed_agents::find_managed_agent_mut(&mut instances, &pubkey)?;
+        record.updated_at = util::now_iso();
+        record.last_error = Some(error);
+        Ok((instances, ()))
+    })
+    .map(|_| ())
 }

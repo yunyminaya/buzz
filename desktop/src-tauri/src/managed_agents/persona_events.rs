@@ -9,6 +9,8 @@ use buzz_core_pkg::kind::{event_is_shared, KIND_PERSONA};
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
 
+use rusqlite::OptionalExtension;
+
 use super::{AgentDefinition, ManagedAgentRecord};
 use crate::app_state::AppState;
 
@@ -107,6 +109,13 @@ fn normalize_d_tag(raw: &str) -> String {
     }
     out.truncate(64);
     out
+}
+
+/// Public wrapper for [`normalize_d_tag`]. Used by callers that hold raw slug
+/// strings (e.g. `source_team_persona_slug`) and need the same normalization
+/// applied by [`persona_d_tag`] without constructing an `AgentDefinition`.
+pub fn normalize_d_tag_pub(raw: &str) -> String {
+    normalize_d_tag(raw)
 }
 
 /// Compute the NIP-AP monotonic `created_at` for a write (`docs/nips/NIP-AP.md:117`
@@ -231,7 +240,7 @@ pub async fn flush_pending_events(
 ) -> Result<u32, String> {
     let relay_url = crate::relay::relay_ws_url_with_override(state);
     let owner_keys = state.signing_keys()?;
-    flush_pending_events_at(db_path, state, &relay_url, &owner_keys).await
+    flush_pending_events_at(db_path, None, state, &relay_url, &owner_keys).await
 }
 
 /// Resolve and flush only the currently active `(relay, owner)` scope.
@@ -244,11 +253,19 @@ pub async fn flush_active_pending_events(
     state: &AppState,
 ) -> Result<u32, String> {
     let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-    flush_pending_events_at(&scope.db_path, state, &scope.relay_url, &scope.owner_keys).await
+    flush_pending_events_at(
+        &scope.db_path,
+        Some(app),
+        state,
+        &scope.relay_url,
+        &scope.owner_keys,
+    )
+    .await
 }
 
 async fn flush_pending_events_at(
     db_path: &std::path::Path,
+    app: Option<&tauri::AppHandle>,
     state: &AppState,
     relay_url: &str,
     owner_keys: &nostr::Keys,
@@ -330,6 +347,57 @@ async fn flush_pending_events_at(
             current.created_at,
             &current.content,
         )?;
+
+        // Mark the outbox event published in the B1 journal so boot recovery
+        // does not re-drive it and the operation can advance to Committed.
+        // Best-effort: a journal hiccup must not block the flush loop.
+        let event_id = event.id.to_hex();
+        if let Some(app) = app {
+            if let Ok(anchor) = crate::managed_agents::store_journal::store_anchor_dir(app) {
+                if let Ok(journal) = crate::managed_agents::store_journal::open_journal(&anchor) {
+                    let marked = crate::managed_agents::store_journal::mark_outbox_published(
+                        &journal, &event_id, 0, // pending → published
+                        1,
+                    )
+                    .unwrap_or(false);
+
+                    // If the outbox row advanced, try to advance its owning
+                    // operation to Committed: check whether all outbox rows for
+                    // that op are now published, then do the disposition CAS.
+                    if marked {
+                        if let Ok(Some(op_id)) = journal
+                            .query_row(
+                                "SELECT operation_id FROM outbox_events WHERE event_id = ?1",
+                                rusqlite::params![event_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()
+                        {
+                            use crate::managed_agents::store_journal::advance_disposition;
+                            use crate::managed_agents::store_journal::Disposition;
+                            // Advance only if all sibling outbox events are published.
+                            let pending_siblings: i64 = journal
+                                .query_row(
+                                    "SELECT COUNT(*) FROM outbox_events
+                                 WHERE operation_id = ?1 AND published_state = 0",
+                                    rusqlite::params![op_id],
+                                    |row| row.get(0),
+                                )
+                                .unwrap_or(1);
+                            if pending_siblings == 0 {
+                                let _ = advance_disposition(
+                                    &journal,
+                                    &op_id,
+                                    &Disposition::Pending,
+                                    &Disposition::Committed,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         flushed += 1;
     }
 

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
-    io::{Read as _, Seek, SeekFrom, Write},
+    fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -42,6 +42,7 @@ pub fn managed_agents_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+#[allow(dead_code)]
 pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("managed-agents.json"))
 }
@@ -234,31 +235,55 @@ pub(crate) fn spawn_key_refusal(record: &ManagedAgentRecord) -> Option<String> {
     })
 }
 
-/// Read the raw unified store — keyed instances AND key-less definitions —
-/// with fail-loud parse handling. Internal seam; public readers filter.
-fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
-    let path = managed_agents_store_path(app)?;
-    if !path.exists() {
+/// Read from `agents_path`. Caller must hold the advisory lock.
+fn load_agent_store_locked(
+    _anchor: &std::path::Path,
+    agents_path: &std::path::Path,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    if !agents_path.exists() {
         return Ok(Vec::new());
     }
-
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read agent store: {error}"))?;
-    serde_json::from_str(&content).map_err(|error| {
+    let bytes =
+        fs::read(agents_path).map_err(|error| format!("failed to read agent store: {error}"))?;
+    crate::managed_agents::store_journal::decode_agent_store(&bytes).map_err(|e| {
         // Fail loudly and preserve the evidence: a later in-app save rewrites
         // this file wholesale, which would silently destroy a malformed hand
         // edit. Best-effort file-authoring contract (see managed_agents::
         // reconcile): the broken content survives as `.invalid` for the user
         // to recover, and the parse error propagates instead of being
         // swallowed into an empty store.
-        backup_invalid_store(&path);
-        format!("failed to parse agent store (preserved as .invalid): {error}")
+        backup_invalid_store(agents_path);
+        format!(
+            "failed to parse agent store (preserved as .invalid): {}",
+            e.message
+        )
     })
+}
+
+/// Read the raw unified store — keyed instances AND key-less definitions —
+/// with fail-loud parse handling. Internal seam; public readers filter.
+///
+/// Acquires the B1 advisory store lock so this call is serialized against
+/// concurrent writers from other processes.  The in-process mutex
+/// (`AppState::managed_agents_store_lock`) is held by callers at the
+/// command level; the OS advisory lock here closes the cross-process gap.
+fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
+    let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
+    std::fs::create_dir_all(&anchor).map_err(|e| format!("failed to create anchor dir: {e}"))?;
+    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor)?;
+    let agents_path = anchor.join("managed-agents.json");
+    load_agent_store_locked(&anchor, &agents_path)
 }
 
 /// Load the keyed agent *instances*. Key-less definitions (former personas,
 /// folded into the same store) are filtered out so every pre-fold call site
 /// keeps seeing exactly the records it always did.
+///
+/// NOTE: This function acquires and immediately releases the OS advisory lock.
+/// For read-only contexts where the in-process mutex is already held, this is
+/// safe.  For any path that follows with a `save_managed_agents` call, use
+/// `mutate_managed_agents` instead so the OS lock is held across the full
+/// read → mutate → write sequence.
 pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| !record.pubkey.is_empty());
@@ -355,66 +380,114 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
     }
 }
 
-/// Save the keyed agent *instances*, preserving the key-less definitions that
-/// share the unified store: callers pass exactly the records they loaded via
-/// [`load_managed_agents`], and this re-reads the definition half from disk
-/// before the wholesale rewrite so a definition is never dropped by an
-/// instance-side save (and vice versa via [`save_agent_definitions`]).
-pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> Result<(), String> {
-    let definitions = load_agent_definitions(app).unwrap_or_default();
-    let mut sorted = records.to_vec();
-    // A caller-supplied key-less record would collide with the definition
-    // half re-read below; instances always carry a pubkey.
-    sorted.retain(|record| !record.pubkey.is_empty());
-    sorted.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.pubkey.cmp(&right.pubkey))
-    });
+/// Atomically mutate the **instance** half of the agent store via a closure,
+/// holding the OS advisory lock across fresh-decode → mutation → write.
+/// `mutation` receives instances WITHOUT keyring hydration (keys stay as-is
+/// from JSON — the closure works with the raw records and must not call
+/// keyring APIs).  After the file write the advisory lock is released and
+/// THEN keyring operations run outside all critical sections.
+///
+/// Returns `(T, guard)` so post-write work can run inside the in-process lock.
+pub fn mutate_agent_store<'g, F, T>(
+    app: &AppHandle,
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    mutation: F,
+) -> Result<(T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(
+        Vec<ManagedAgentRecord>,
+        &rusqlite::Connection,
+    ) -> Result<(Vec<ManagedAgentRecord>, T), String>,
+{
+    crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+        // Present instances to the closure WITHOUT keyring hydration: keyring
+        // I/O is prohibited inside the critical section.  The closure is
+        // responsible for not calling hydrate_keys or persist_agent_keys.
+        let instances: Vec<ManagedAgentRecord> = st
+            .agents
+            .iter()
+            .filter(|r| !r.pubkey.is_empty())
+            .cloned()
+            .collect();
 
-    // Persist each key to the keyring; on success blank the inline copy so it
-    // is skipped from JSON (`skip_serializing_if = "String::is_empty"`). If the
-    // keyring is unreachable, the key stays inline.
-    persist_agent_keys(&mut sorted);
+        let defs: Vec<ManagedAgentRecord> = st
+            .agents
+            .into_iter()
+            .filter(|r| r.pubkey.is_empty())
+            .collect();
+        let teams = st.teams;
 
-    write_agent_store(app, definitions, sorted)
+        let (mut new_instances, result) = mutation(instances, st.journal)?;
+
+        // Sort instances (no keyring I/O here — keys stay as-is from mutation).
+        new_instances.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.pubkey.cmp(&b.pubkey))
+        });
+
+        let mut all_defs = defs;
+        all_defs.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let mut all = all_defs;
+        all.extend(new_instances);
+
+        Ok((all, teams, result))
+    })
 }
 
-/// Save the key-less agent *definitions*, preserving the keyed instances —
-/// the definition-side mirror of [`save_managed_agents`].
-pub(crate) fn save_agent_definitions(
+/// Atomically mutate a single agent instance by pubkey, holding the OS
+/// advisory lock across fresh-decode → find → update → write.
+///
+/// Returns `(modified_record_clone, guard)` on success.  Returns `Err` when
+/// the agent is not found or the decode fails.
+pub fn mutate_managed_agent<'g, F, T>(
     app: &AppHandle,
-    definitions: &[ManagedAgentRecord],
-) -> Result<(), String> {
-    let mut instances = load_agent_store(app)?;
-    instances.retain(|record| !record.pubkey.is_empty());
-    let mut definitions = definitions.to_vec();
-    definitions.retain(|record| record.pubkey.is_empty());
-    write_agent_store(app, definitions, instances)
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    pubkey: &str,
+    update: F,
+) -> Result<(ManagedAgentRecord, T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(&mut ManagedAgentRecord, &rusqlite::Connection) -> Result<T, String>,
+{
+    let pubkey = pubkey.to_owned();
+    mutate_agent_store(app, store_mutex_guard, move |mut instances, journal| {
+        let record = instances
+            .iter_mut()
+            .find(|r| r.pubkey == pubkey)
+            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let extra = update(record, journal)?;
+        let record_clone = record.clone();
+        Ok((instances, (record_clone, extra)))
+    })
+    .map(|((record_clone, extra), guard)| (record_clone, extra, guard))
 }
 
-/// Serialize definitions + instances into the single unified store file.
-/// Definitions sort first (by slug) for stable diffs; instances keep the
-/// name/pubkey order their save path established.
-fn write_agent_store(
+/// Atomically mutate the **team** half of the store via a closure, holding the
+/// OS advisory lock across fresh-decode → mutation → write of both JSON files.
+///
+/// `mutation` receives the full current team list and the open journal
+/// connection, and returns a modified team list plus an arbitrary result
+/// value `T`.  The agents half is preserved exactly (pass-through).
+///
+/// Returns `(T, guard)` so the caller can perform post-write work while still
+/// holding the in-process mutex.
+pub fn mutate_team_store<'g, F, T>(
     app: &AppHandle,
-    mut definitions: Vec<ManagedAgentRecord>,
-    instances: Vec<ManagedAgentRecord>,
-) -> Result<(), String> {
-    definitions.sort_by(|left, right| left.slug.cmp(&right.slug));
-    let mut all = definitions;
-    all.extend(instances);
-
-    let path = managed_agents_store_path(app)?;
-    let payload = serde_json::to_vec_pretty(&all)
-        .map_err(|error| format!("failed to serialize agent store: {error}"))?;
-
-    // `managed-agents.json` carries plaintext agent nsecs in the keyringless
-    // fallback. Write it owner-only (`0o600`) unconditionally — harmless for the
-    // keyring-backed case (it is the user's own agent store) and closes the
-    // umask window a post-write `chmod` would leave open.
-    atomic_write_json_restricted(&path, &payload)
+    store_mutex_guard: std::sync::MutexGuard<'g, ()>,
+    mutation: F,
+) -> Result<(T, std::sync::MutexGuard<'g, ()>), String>
+where
+    F: FnOnce(
+        Vec<crate::managed_agents::TeamRecord>,
+        &rusqlite::Connection,
+    ) -> Result<(Vec<crate::managed_agents::TeamRecord>, T), String>,
+{
+    crate::managed_agents::store_journal::mutate_store(app, store_mutex_guard, move |st| {
+        let agents = st.agents;
+        let (new_teams, result) = mutation(st.teams, st.journal)?;
+        Ok((agents, new_teams, result))
+    })
 }
 
 /// Write each record's in-memory key to the keyring and blank the inline copy
@@ -427,6 +500,81 @@ fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
         return;
     };
     persist_agent_keys_with(store, records);
+}
+
+/// Write each record's in-memory key to the keyring, recording a journal
+/// pre-image before each write so boot recovery can detect interrupted writes.
+///
+/// Each key write that finds a non-empty `private_key_nsec` gets a
+/// `keyring_write` journal operation.  On success the operation advances to
+/// `Committed`; on failure (keyring unreachable, write/verify error) it advances
+/// to `Failed` and the key stays inline.  Best-effort: a journal error must
+/// never block the actual keyring write — if the journal record fails we fall
+/// back to the unwrapped path and log the hiccup.
+#[allow(dead_code)] // B1 keyring-journal protocol — wired to compensation phase in B1.1
+fn persist_agent_keys_journaled(
+    records: &mut [ManagedAgentRecord],
+    journal: &rusqlite::Connection,
+) {
+    let Some(store) = agent_secret_store() else {
+        return;
+    };
+    for record in records.iter_mut() {
+        if record.private_key_nsec.is_empty() {
+            continue;
+        }
+        // Record a pre-image before the keyring write.
+        let op_id = crate::managed_agents::store_journal::new_operation_id();
+        // event_id = deterministic key based on op_id; payload = just the pubkey
+        // bytes so boot recovery can identify which agent's key was mid-flight.
+        let event_id = format!("keyring_write:{op_id}");
+        let journal_ok = (|| -> Result<(), String> {
+            crate::managed_agents::store_journal::insert_operation(
+                journal,
+                &op_id,
+                "keyring_write",
+                &record.pubkey,
+                crate::managed_agents::store_journal::Generation::zero(),
+            )?;
+            crate::managed_agents::store_journal::insert_inbox_event(
+                journal,
+                &event_id,
+                &op_id,
+                record.pubkey.as_bytes(),
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = journal_ok {
+            eprintln!(
+                "buzz-desktop: keyring-journal: pre-image record failed for {}: {e}",
+                record.pubkey
+            );
+        }
+
+        let outcome = migrate_inline_key(store, record);
+        if outcome == KeyMigration::Persisted {
+            record.private_key_nsec.clear();
+        }
+
+        // Advance the journal operation to reflect the actual outcome.
+        let disposition = if outcome == KeyMigration::Persisted {
+            crate::managed_agents::store_journal::Disposition::Committed
+        } else {
+            crate::managed_agents::store_journal::Disposition::Failed
+        };
+        let _ = crate::managed_agents::store_journal::advance_disposition(
+            journal,
+            &op_id,
+            &crate::managed_agents::store_journal::Disposition::Pending,
+            &disposition,
+        );
+    }
+}
+
+/// Public wrapper around [`persist_agent_keys`] for callers that build their
+/// own record lists inside a `mutate_store` closure (e.g. `team_snapshot.rs`).
+pub fn persist_agent_keys_pub(records: &mut [ManagedAgentRecord]) {
+    persist_agent_keys(records);
 }
 
 /// Testable core of [`persist_agent_keys`], generic over the [`KeyStore`] seam.
@@ -595,13 +743,25 @@ pub fn delete_agent_key(pubkey: &str) {
     }
 }
 
-/// Atomic, symlink-preserving JSON write.
+/// Atomic, symlink-preserving JSON write with fsync before rename.
 /// Resolves symlinks so the tmp+rename happens at the real target path,
 /// preserving any symlink at `path`.
+///
+/// Sequence: write tmp → fsync → rename over target.  The fsync ensures the
+/// bytes survive a crash between the write and the rename; without it a torn
+/// write could leave a zero-length or truncated file on the target path.
+#[allow(dead_code)]
 pub(crate) fn atomic_write_json(path: &Path, payload: &[u8]) -> Result<(), String> {
+    use std::io::Write;
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let tmp = resolved.with_extension("json.tmp");
-    std::fs::write(&tmp, payload).map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    file.write_all(payload)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+    drop(file);
     std::fs::rename(&tmp, &resolved)
         .map_err(|e| format!("failed to rename {}: {e}", resolved.display()))
 }
@@ -634,92 +794,10 @@ pub(crate) fn atomic_write_json_restricted(path: &Path, payload: &[u8]) -> Resul
         .map_err(|e| format!("commit {}: {e}", resolved.display()))
 }
 
-/// Maximum log file size before rotation (10 MB).
-const MAX_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
-/// If `path` exceeds [`MAX_LOG_FILE_SIZE`], rotate it to `<path>.1`.
-fn maybe_rotate_log(path: &Path) {
-    let size = match fs::metadata(path) {
-        Ok(m) => m.len(),
-        Err(_) => return,
-    };
-    if size <= MAX_LOG_FILE_SIZE {
-        return;
-    }
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    let _ = fs::rename(path, &rotated);
-}
-
-pub(crate) fn open_log_file(path: &Path) -> Result<File, String> {
-    maybe_rotate_log(path);
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("failed to open log file {}: {error}", path.display()))
-}
-
-/// Start a new install-log session at `path`: keep the previous run as
-/// `<path>.1` and return a freshly created, empty current file.
-///
-/// Rotating per *run* rather than by size is what bounds this file. A run
-/// writes one record per executed attempt, each capped by the log-scale
-/// capture, so one run's file is bounded by steps × attempts × cap and the
-/// history on disk is bounded at two runs. Size-triggered rotation could not
-/// promise either: it never replaced an existing `.1`, and on Windows —
-/// where rename does not replace its destination — it stopped working
-/// altogether once `.1` existed, leaving the current file to grow.
-///
-/// The old `.1` is therefore *removed* before the rename rather than renamed
-/// over. Every step is best-effort: a rotation that fails must not cost the
-/// user the install, so the session continues with a truncated current file.
-pub(crate) fn start_install_log_session(path: &Path) -> Result<File, String> {
-    if path.exists() {
-        let mut previous = path.as_os_str().to_owned();
-        previous.push(".1");
-        let previous = PathBuf::from(previous);
-        let _ = fs::remove_file(&previous);
-        let _ = fs::rename(path, &previous);
-    }
-    open_install_log(path, /* truncate */ true)
-}
-
-/// Open an install log for appending one more record to the current session.
-pub(crate) fn open_install_log_file(path: &Path) -> Result<File, String> {
-    open_install_log(path, /* truncate */ false)
-}
-
-/// Open an install log owner-only.
-///
-/// The mode is set *in the create* rather than chmod'd afterwards, so the file
-/// is never briefly group/world-readable. Install output can carry registry
-/// tokens and proxy credentials echoed by a failing installer, so the window
-/// matters even though it is short. An existing file's mode is left as-is —
-/// `OpenOptions::mode` only applies on creation, and silently re-tightening a
-/// file the user relaxed is not this function's call to make.
-fn open_install_log(path: &Path, truncate: bool) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.create(true);
-    if truncate {
-        options.write(true).truncate(true);
-    } else {
-        options.append(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|error| format!("failed to open log file {}: {error}", path.display()))
-}
-
-pub(crate) fn append_log_marker(path: &Path, message: &str) -> Result<(), String> {
-    let mut file = open_log_file(path)?;
-    writeln!(file, "{message}").map_err(|error| format!("failed to write log marker: {error}"))
-}
+pub(crate) use crate::managed_agents::agent_log_files::{
+    append_log_marker, meaningful_agent_error_from_log, open_install_log_file, open_log_file,
+    read_log_tail, start_install_log_session, AgentLogError,
+};
 
 fn agent_pids_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = managed_agents_base_dir(app)?.join("agent-pids");
@@ -798,110 +876,6 @@ pub fn read_all_agent_pid_files(app: &AppHandle) -> Vec<(String, u32)> {
             Some((pubkey.to_string(), pid))
         })
         .collect()
-}
-
-pub fn read_log_tail(path: &Path, max_lines: usize) -> Result<String, String> {
-    if !path.exists() {
-        return Ok(String::new());
-    }
-
-    let mut file = File::open(path)
-        .map_err(|error| format!("failed to read log file {}: {error}", path.display()))?;
-
-    let file_len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|error| format!("failed to seek log file: {error}"))?;
-
-    if file_len == 0 {
-        return Ok(String::new());
-    }
-
-    // Read backward in chunks to find enough newlines.
-    const CHUNK_SIZE: u64 = 8 * 1024;
-    let mut buf = Vec::new();
-    let mut remaining = file_len;
-    let mut newline_count: usize = 0;
-    // We need max_lines + 1 newlines to delimit max_lines lines (the trailing
-    // newline of the last line counts as one).
-    let target_newlines = max_lines + 1;
-
-    while remaining > 0 && newline_count < target_newlines {
-        let chunk = remaining.min(CHUNK_SIZE);
-        remaining -= chunk;
-        file.seek(SeekFrom::Start(remaining))
-            .map_err(|error| format!("failed to seek log file: {error}"))?;
-
-        let mut tmp = vec![0u8; chunk as usize];
-        file.read_exact(&mut tmp)
-            .map_err(|error| format!("failed to read log chunk: {error}"))?;
-
-        // Prepend this chunk so buf always has the tail of the file.
-        tmp.append(&mut buf);
-        buf = tmp;
-
-        newline_count = bytecount_newlines(&buf);
-    }
-
-    // Strip ANSI escapes here (not in the harness) so the desktop log view
-    // renders cleanly while terminals and other tools still get the colors
-    // buzz-acp emits.
-    let cleaned = strip_ansi_escapes::strip_str(String::from_utf8_lossy(&buf));
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    Ok(lines[start..].join("\n"))
-}
-
-fn bytecount_newlines(buf: &[u8]) -> usize {
-    buf.iter().filter(|&&b| b == b'\n').count()
-}
-
-/// A meaningful error recovered from an exited agent's log tail.
-pub struct AgentLogError {
-    /// The full log line, wrapped as `Agent reported error…` for display.
-    pub message: String,
-    /// JSON-RPC error code parsed from the line's `(code N)` marker, or a
-    /// synthetic code for known bare prefixes. `None` for legacy-format
-    /// lines that carry no code (or when the code fails to parse as i64).
-    pub code: Option<i64>,
-}
-
-pub fn meaningful_agent_error_from_log(path: &Path) -> Option<AgentLogError> {
-    let tail = read_log_tail(path, 200).ok()?;
-    tail.lines().rev().map(str::trim).find_map(|line| {
-        // New format: "Agent reported error (code -32002): ..."
-        if let Some(rest) = line.strip_prefix("Agent reported error (code ") {
-            if let Some(paren_end) = rest.find("): ") {
-                let code = rest[..paren_end].parse::<i64>().ok();
-                return Some(AgentLogError {
-                    message: line.to_string(),
-                    code,
-                });
-            }
-        }
-        // Legacy format (older buzz-acp builds): "Agent reported error: ..."
-        if line.starts_with("Agent reported error:") {
-            return Some(AgentLogError {
-                message: line.to_string(),
-                code: None,
-            });
-        }
-        // Bare prefixes emitted by older agent binaries whose Display still leaks
-        // unwrapped errors. Promote these so they surface instead of the generic
-        // "harness exited with status N" fallback.
-        if line.starts_with("llm auth:") {
-            return Some(AgentLogError {
-                message: format!("Agent reported error: {line}"),
-                code: Some(-32001),
-            });
-        }
-        if line.starts_with("llm model not found:") {
-            return Some(AgentLogError {
-                message: format!("Agent reported error: {line}"),
-                code: Some(-32002),
-            });
-        }
-        None
-    })
 }
 
 #[cfg(test)]

@@ -52,7 +52,7 @@ fn save_mesh_sharing_config(app: &AppHandle, config: &MeshSharingConfig) -> Resu
     }
     let payload = serde_json::to_vec_pretty(config)
         .map_err(|error| format!("failed to encode mesh sharing config: {error}"))?;
-    crate::managed_agents::atomic_write_json(&path, &payload)
+    crate::managed_agents::store_journal::atomic_write_with_fsync(&path, &payload)
 }
 
 fn load_mesh_sharing_config(app: &AppHandle) -> Result<Option<MeshSharingConfig>, String> {

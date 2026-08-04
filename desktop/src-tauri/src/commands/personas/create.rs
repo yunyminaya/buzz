@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        apply_persona_behavior, load_personas, save_personas, try_regenerate_nest, AgentDefinition,
+        apply_persona_behavior, mutate_persona_store, try_regenerate_nest, AgentDefinition,
         CatalogSource, CreatePersonaRequest,
     },
     util::now_iso,
@@ -38,12 +38,10 @@ pub async fn create_persona(
             .map(CatalogSource::normalized)
             .transpose()?;
         let now = now_iso();
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
         let name_pool: Vec<String> = input
             .name_pool
             .into_iter()
@@ -51,31 +49,39 @@ pub async fn create_persona(
             .filter(|s| !s.is_empty())
             .collect();
         crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
-        let mut persona = AgentDefinition {
-            id: Uuid::new_v4().to_string(),
-            display_name,
-            avatar_url,
-            system_prompt,
-            runtime,
-            model,
-            provider,
-            name_pool,
-            is_builtin: false,
-            is_active: true,
-            shared: false,
-            source_team: None,
-            source_team_persona_slug: None,
-            catalog_source,
-            env_vars: input.env_vars,
-            respond_to: None,
-            respond_to_allowlist: Vec::new(),
-            parallelism: None,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        apply_persona_behavior(&mut persona, input.behavior)?;
-        personas.push(persona.clone());
-        save_personas(&app, &personas)?;
+        let env_vars = input.env_vars;
+        let behavior = input.behavior;
+
+        let app_for_closure = app.clone();
+        let (persona, _guard) = mutate_persona_store(&app, store_guard, move |mut personas| {
+            let state_c = app_for_closure.state::<AppState>();
+            pending::project_active_persona_sharing(&app_for_closure, &state_c, &mut personas);
+            let mut persona = AgentDefinition {
+                id: Uuid::new_v4().to_string(),
+                display_name,
+                avatar_url,
+                system_prompt,
+                runtime,
+                model,
+                provider,
+                name_pool,
+                is_builtin: false,
+                is_active: true,
+                shared: false,
+                source_team: None,
+                source_team_persona_slug: None,
+                catalog_source,
+                env_vars,
+                respond_to: None,
+                respond_to_allowlist: Vec::new(),
+                parallelism: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            apply_persona_behavior(&mut persona, behavior)?;
+            personas.push(persona.clone());
+            Ok((personas, persona))
+        })?;
         retain_persona_pending(&app, &state, &persona);
         try_regenerate_nest(&app);
         Ok(persona)

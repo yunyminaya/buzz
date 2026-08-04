@@ -18,8 +18,7 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
-        ManagedAgentRecord, RespondTo,
+        load_managed_agents, AgentDefinition, ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -542,18 +541,10 @@ pub async fn confirm_agent_snapshot_import(
 
     // ── Phase 3a: create AgentDefinition + ManagedAgentRecord (sync lock) ──────
     let (persona, record) = {
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-
-        let mut personas = load_personas(&app)?;
-        let mut records = load_managed_agents(&app)?;
-
-        // Guard against duplicate pubkey (astronomically unlikely but safe).
-        if records.iter().any(|r| r.pubkey == pubkey) {
-            return Err(format!("generated pubkey {pubkey} already exists — retry"));
-        }
 
         let now = now_iso();
         let persona_id = uuid::Uuid::new_v4().to_string();
@@ -586,8 +577,16 @@ pub async fn confirm_agent_snapshot_import(
             updated_at: now.clone(),
         };
 
-        personas.push(persona.clone());
-        save_personas(&app, &personas)?;
+        // Write the persona definition atomically, then drop the guard before
+        // acquiring a new one for the agent record write below.
+        let persona_for_closure = persona.clone();
+        let ((), store_guard_after_persona) =
+            crate::managed_agents::mutate_persona_store(&app, store_guard, move |mut defs| {
+                defs.push(persona_for_closure);
+                Ok((defs, ()))
+            })?;
+        // Drop the persona-store guard before re-acquiring for the agent record.
+        drop(store_guard_after_persona);
 
         // Enqueue the kind:30175 persona event via the retention path.
         super::super::pending::retain_persona_pending(&app, &state, &persona);
@@ -656,8 +655,29 @@ pub async fn confirm_agent_snapshot_import(
             name_pool: snapshot.definition.name_pool.clone(),
         };
 
-        records.push(record.clone());
-        save_managed_agents(&app, &records)?;
+        let pubkey_c = pubkey.clone();
+        let mut record_for_save = record.clone();
+        // Keyring chokepoint: push nsec into OS keyring before store lock,
+        // same pattern as agents.rs create path. If keyring unavailable, key
+        // stays inline (file fallback).
+        crate::managed_agents::storage::persist_agent_keys_pub(std::slice::from_mut(
+            &mut record_for_save,
+        ));
+        let record_c = record_for_save;
+        let store_guard2 = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        crate::managed_agents::mutate_agent_store(&app, store_guard2, move |mut instances, _j| {
+            if instances.iter().any(|r| r.pubkey == pubkey_c) {
+                return Err(format!(
+                    "generated pubkey {pubkey_c} already exists — retry"
+                ));
+            }
+            instances.push(record_c);
+            Ok((instances, ()))
+        })
+        .map(|_| ())?;
 
         // Enqueue the kind:30177 managed-agent event via retention.
         // (Uses the same pattern as agents.rs::retain_managed_agent_pending
@@ -753,49 +773,7 @@ pub async fn confirm_agent_snapshot_import(
 /// `agents::retain_managed_agent_pending` without requiring cross-module
 /// private function access.
 fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
-    use crate::managed_agents::{
-        agent_events::{agent_event_content, build_agent_event},
-        persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
-    };
-    use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-    use nostr::JsonUtil;
-
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let conn = open_retention_db(&scope.db_path)?;
-        let content = serde_json::to_string(&agent_event_content(record))
-            .map_err(|e| format!("failed to serialize agent content: {e}"))?;
-        let (owner_pubkey, event) = {
-            let keys = &scope.owner_keys;
-            let owner_pubkey = keys.public_key().to_hex();
-            let existing =
-                get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
-            if existing.as_ref().is_some_and(|row| row.content == content) {
-                return Ok(());
-            }
-            let event = build_agent_event(record)?
-                .custom_created_at(monotonic_created_at(existing.map(|row| row.created_at)))
-                .sign_with_keys(keys)
-                .map_err(|e| format!("failed to sign agent event: {e}"))?;
-            (owner_pubkey, event)
-        };
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_MANAGED_AGENT,
-                pubkey: owner_pubkey,
-                d_tag: record.pubkey.clone(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
-        )
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: snapshot-import retain-agent: {e}");
-    }
+    super::retain::retain_agent_pending(app, state, record);
 }
 
 /// POST a pre-built signed engram event to the relay, authenticating as the

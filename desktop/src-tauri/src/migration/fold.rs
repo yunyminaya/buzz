@@ -23,7 +23,14 @@ pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;
     };
-    match fold_personas_in_dir(&base_dir) {
+    let anchor = match crate::managed_agents::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: persona-store-fold: failed to resolve anchor: {e}");
+            return;
+        }
+    };
+    match fold_personas_in_dir(&base_dir, &anchor) {
         Ok(None) => {}
         Ok(Some(folded)) => {
             eprintln!(
@@ -38,11 +45,15 @@ pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
 /// Operates on the raw JSON files — no keyring interaction: instance records
 /// are passed through byte-identical, and folded definitions carry no keys.
 /// Returns `Ok(None)` when there is no `personas.json` to fold.
-fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
+fn fold_personas_in_dir(base_dir: &Path, anchor: &Path) -> Result<Option<usize>, String> {
     let personas_path = base_dir.join("personas.json");
     if !personas_path.exists() {
         return Ok(None);
     }
+
+    // Acquire the B1 advisory lock so this migration write is serialized
+    // against any concurrent process that may be reading or writing the store.
+    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(anchor)?;
 
     let personas = crate::managed_agents::load_personas_from_path(&personas_path)?;
 
@@ -50,8 +61,9 @@ fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
     let mut all: Vec<crate::managed_agents::ManagedAgentRecord> = if agents_path.exists() {
         let content = std::fs::read_to_string(&agents_path)
             .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?
+        // Fail-closed codec: unknown/malformed content ⇒ error, zero mutation.
+        crate::managed_agents::store_journal::decode_agent_store(content.as_bytes())
+            .map_err(|e| e.message)?
     } else {
         Vec::new()
     };
@@ -74,7 +86,10 @@ fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
 
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|e| format!("failed to serialize unified store: {e}"))?;
-    crate::managed_agents::atomic_write_json_restricted(&agents_path, &payload)?;
+    crate::managed_agents::store_journal::atomic_write_restricted_with_fsync(
+        &agents_path,
+        &payload,
+    )?;
 
     // Rename only after the unified store write succeeded — a crash between
     // the two leaves personas.json in place and the fold re-runs idempotently
@@ -201,7 +216,7 @@ mod tests {
         );
 
         let base = dir.path().join("agents");
-        let folded = fold_personas_in_dir(&base).unwrap();
+        let folded = fold_personas_in_dir(&base, &base).unwrap();
         assert_eq!(folded, Some(1), "custom folds, builtin skipped");
 
         let records = read_agents_json(dir.path());
@@ -231,12 +246,12 @@ mod tests {
             &serde_json::json!([custom_persona_json("custom:one", "goose")]),
         );
         let base = dir.path().join("agents");
-        assert_eq!(fold_personas_in_dir(&base).unwrap(), Some(1));
+        assert_eq!(fold_personas_in_dir(&base, &base).unwrap(), Some(1));
 
         // Crash simulation: restore personas.json from the .bak.
         std::fs::copy(base.join("personas.json.bak"), base.join("personas.json")).unwrap();
         assert_eq!(
-            fold_personas_in_dir(&base).unwrap(),
+            fold_personas_in_dir(&base, &base).unwrap(),
             Some(0),
             "second run folds nothing (slug dedup)"
         );
@@ -253,7 +268,7 @@ mod tests {
         );
         let base = dir.path().join("agents");
         let before = std::fs::read_to_string(base.join("managed-agents.json")).unwrap();
-        assert_eq!(fold_personas_in_dir(&base).unwrap(), None);
+        assert_eq!(fold_personas_in_dir(&base, &base).unwrap(), None);
         let after = std::fs::read_to_string(base.join("managed-agents.json")).unwrap();
         assert_eq!(before, after, "store untouched when nothing to fold");
     }
@@ -275,7 +290,7 @@ mod tests {
         let pre = load_persona_runtimes(&agents_path);
         assert_eq!(pre.get("custom:one").map(String::as_str), Some("goose"));
 
-        fold_personas_in_dir(&base).unwrap();
+        fold_personas_in_dir(&base, &base).unwrap();
 
         // Post-fold: personas.json is gone; map must come from the unified store
         // and be identical.
@@ -295,7 +310,7 @@ mod tests {
             &serde_json::json!([custom_persona_json("custom:one", "goose")]),
         );
         let base = dir.path().join("agents");
-        assert_eq!(fold_personas_in_dir(&base).unwrap(), Some(1));
+        assert_eq!(fold_personas_in_dir(&base, &base).unwrap(), Some(1));
 
         // Post-fold edit in the unified store.
         let mut records = read_agents_json(dir.path());
@@ -304,7 +319,7 @@ mod tests {
 
         // Crash simulation: stale personas.json (runtime still "goose") returns.
         std::fs::copy(base.join("personas.json.bak"), base.join("personas.json")).unwrap();
-        assert_eq!(fold_personas_in_dir(&base).unwrap(), Some(0));
+        assert_eq!(fold_personas_in_dir(&base, &base).unwrap(), Some(0));
 
         let records = read_agents_json(dir.path());
         assert_eq!(records.len(), 1);

@@ -64,11 +64,34 @@ pub fn spawn_event_sync(
 pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
     use crate::managed_agents::managed_agents_base_dir;
 
-    let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return;
+    // Resolve the anchor dir — both the lock path AND the file path must come
+    // from store_anchor_dir so this read is serialised against concurrent
+    // writers that also hold the advisory lock.
+    let anchor = match crate::managed_agents::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: persona-event-migration: anchor resolution failed: {e}");
+            return;
+        }
     };
 
-    match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
+    // Acquire the B1 advisory lock.  Fail-closed: if we cannot acquire the
+    // lock we skip the reconcile for this boot rather than reading potentially
+    // stale files from the wrong path.
+    let _advisory = match crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: persona-event-migration: advisory lock failed — \
+                     skipping reconcile: {e}"
+            );
+            return;
+        }
+    };
+
+    // Read from the anchor dir, not the local base dir.  Before symlinks are
+    // set up the anchor and local dir may differ; always use the anchor path.
+    match migrate_personas_in_dir_at(&anchor, keys, db_path) {
         Ok(0) => {}
         Ok(migrated) => {
             eprintln!(
@@ -79,6 +102,8 @@ pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db
             eprintln!("buzz-desktop: persona-event-migration: {e}");
         }
     }
+
+    let _ = managed_agents_base_dir(app); // keep import used
 }
 
 /// Core reconcile logic, decoupled from the Tauri `AppHandle` for testing.
@@ -125,9 +150,10 @@ fn migrate_personas_in_dir_at(
             }
             let content = std::fs::read_to_string(&agents_path)
                 .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
+            // Fail-closed codec: unknown/malformed content ⇒ error, zero mutation.
             let all: Vec<crate::managed_agents::ManagedAgentRecord> =
-                serde_json::from_str(&content)
-                    .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?;
+                crate::managed_agents::store_journal::decode_agent_store(content.as_bytes())
+                    .map_err(|e| e.message)?;
             all.iter()
                 .filter(|record| record.pubkey.is_empty())
                 .filter_map(|record| record.to_definition_view())
@@ -222,11 +248,27 @@ fn migrate_personas_in_dir_at(
 pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
     use crate::managed_agents::managed_agents_base_dir;
 
-    let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return;
+    // Use the anchor dir for both lock and file path (fail-closed on lock failure).
+    let anchor = match crate::managed_agents::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: team-event-migration: anchor resolution failed: {e}");
+            return;
+        }
     };
 
-    match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
+    let _advisory = match crate::managed_agents::store_journal::JournalLockGuard::acquire(&anchor) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: team-event-migration: advisory lock failed — \
+                     skipping reconcile: {e}"
+            );
+            return;
+        }
+    };
+
+    match migrate_teams_in_dir_at(&anchor, keys, db_path) {
         Ok(0) => {}
         Ok(migrated) => {
             eprintln!("buzz-desktop: team-event-migration: {migrated} teams migrated to retention");
@@ -235,6 +277,8 @@ pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_pa
             eprintln!("buzz-desktop: team-event-migration: {e}");
         }
     }
+
+    let _ = managed_agents_base_dir(app); // keep import used
 }
 
 /// Core team reconcile logic, decoupled from the Tauri `AppHandle` for testing.
@@ -268,11 +312,11 @@ fn migrate_teams_in_dir_at(
         return Ok(0);
     }
 
-    let content = std::fs::read_to_string(&teams_path)
-        .map_err(|e| format!("failed to read teams.json: {e}"))?;
+    let bytes =
+        std::fs::read(&teams_path).map_err(|e| format!("failed to read teams.json: {e}"))?;
 
-    let records: Vec<TeamRecord> =
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse teams.json: {e}"))?;
+    let records: Vec<TeamRecord> = crate::managed_agents::store_journal::decode_team_store(&bytes)
+        .map_err(|e| format!("failed to parse teams.json: {}", e.message))?;
 
     if records.is_empty() {
         return Ok(0);

@@ -28,7 +28,14 @@ pub fn detach_directory_backed_teams(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;
     };
-    match detach_directory_backed_teams_in_dir(&base_dir) {
+    let anchor = match crate::managed_agents::store_journal::store_anchor_dir(app) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("buzz-desktop: detach-dir-teams: failed to resolve anchor: {e}");
+            return;
+        }
+    };
+    match detach_directory_backed_teams_in_dir(&base_dir, &anchor) {
         Ok(0) => {}
         Ok(n) => eprintln!("buzz-desktop: detach-dir-teams: detached {n} directory-backed team(s)"),
         Err(e) => eprintln!("buzz-desktop: detach-dir-teams: {e}"),
@@ -39,13 +46,20 @@ pub fn detach_directory_backed_teams(app: &tauri::AppHandle) {
 ///
 /// `base_dir` is the managed-agents base directory (`<AppDataDir>/agents/`).
 /// Returns the number of teams detached (0 = nothing to do).
-pub(super) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<usize, String> {
+pub(super) fn detach_directory_backed_teams_in_dir(
+    base_dir: &Path,
+    anchor: &Path,
+) -> Result<usize, String> {
     let teams_path = base_dir.join("teams.json");
     let agents_path = base_dir.join("managed-agents.json");
 
     if !teams_path.exists() {
         return Ok(0);
     }
+
+    // Acquire the B1 advisory lock so this migration write is serialized
+    // against any concurrent process that may be reading or writing the store.
+    let _advisory = crate::managed_agents::store_journal::JournalLockGuard::acquire(anchor)?;
 
     let teams_content = std::fs::read_to_string(&teams_path)
         .map_err(|e| format!("failed to read teams.json: {e}"))?;
@@ -80,8 +94,10 @@ pub(super) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<us
     if agents_path.exists() {
         let agents_content = std::fs::read_to_string(&agents_path)
             .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
-        let mut agents: Vec<ManagedAgentRecord> = serde_json::from_str(&agents_content)
-            .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?;
+        // Fail-closed codec: unknown/malformed content ⇒ error, zero mutation.
+        let mut agents: Vec<ManagedAgentRecord> =
+            crate::managed_agents::store_journal::decode_agent_store(agents_content.as_bytes())
+                .map_err(|e| e.message)?;
 
         let mut agents_changed = false;
         for agent in agents.iter_mut() {
@@ -109,7 +125,10 @@ pub(super) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<us
         if agents_changed {
             let payload = serde_json::to_vec_pretty(&agents)
                 .map_err(|e| format!("failed to serialize managed-agents.json: {e}"))?;
-            crate::managed_agents::atomic_write_json_restricted(&agents_path, &payload)?;
+            crate::managed_agents::store_journal::atomic_write_restricted_with_fsync(
+                &agents_path,
+                &payload,
+            )?;
         }
     }
 
@@ -154,7 +173,7 @@ pub(super) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<us
 
     let payload = serde_json::to_vec_pretty(&teams)
         .map_err(|e| format!("failed to serialize teams.json: {e}"))?;
-    crate::managed_agents::atomic_write_json(&teams_path, &payload)?;
+    crate::managed_agents::store_journal::atomic_write_with_fsync(&teams_path, &payload)?;
 
     Ok(detached)
 }

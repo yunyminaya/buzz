@@ -16,11 +16,11 @@ use tauri::AppHandle;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-        load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-        resolve_effective_agent_env, save_global_agent_config, save_managed_agents,
-        stop_managed_agent_process, sync_managed_agent_processes, validate_global_config,
-        AgentReadiness, BackendKind, GlobalAgentConfig,
+        agent_readiness, current_instance_id, known_acp_runtime, load_global_agent_config,
+        load_managed_agents, load_personas, mutate_agent_store, record_agent_command,
+        resolve_effective_agent_env, save_global_agent_config, stop_managed_agent_process,
+        sync_managed_agent_processes, validate_global_config, AgentReadiness, BackendKind,
+        GlobalAgentConfig,
     },
 };
 
@@ -262,72 +262,75 @@ async fn restart_local_agent_on_config_change(
         use tauri::Manager;
         let state = app_for_stop.state::<AppState>();
 
-        let _store_guard = state
+        let store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| format!("failed to acquire store lock: {e}"))?;
 
-        let mut records = load_managed_agents(&app_for_stop)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| format!("failed to acquire runtimes lock: {e}"))?;
+        let instance_id = current_instance_id(&app_for_stop);
+        let app_for_stop_closure = app_for_stop.clone();
 
-        // Sync process state so PID liveness reflects current reality.
-        let (sync_changed, _) = sync_managed_agent_processes(
-            &mut records,
-            &mut runtimes,
-            &current_instance_id(&app_for_stop),
-        );
-        if sync_changed {
-            save_managed_agents(&app_for_stop, &records)?;
-        }
+        let (runtime_keys, _guard) = mutate_agent_store(
+            &app_for_stop,
+            store_guard,
+            move |mut instances, _journal| {
+                // Sync process state so PID liveness reflects current reality.
+                sync_managed_agent_processes(&mut instances, &mut runtimes, &instance_id);
 
-        // Re-check eligibility under lock with current record state.
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == pubkey_owned)
-            .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
+                let record = instances
+                    .iter()
+                    .find(|r| r.pubkey == pubkey_owned)
+                    .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
 
-        if record.backend != BackendKind::Local {
-            return Err(format!("agent {pubkey_owned} is no longer a local agent"));
-        }
-        let runtime_keys =
-            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
-        if runtime_keys.is_empty() {
-            return Err(format!(
-                "agent {pubkey_owned} no longer has a live pair runtime after sync"
-            ));
-        }
+                if record.backend != BackendKind::Local {
+                    return Err(format!("agent {pubkey_owned} is no longer a local agent"));
+                }
+                let runtime_keys =
+                    crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
+                if runtime_keys.is_empty() {
+                    return Err(format!(
+                        "agent {pubkey_owned} no longer has a live pair runtime after sync"
+                    ));
+                }
 
-        // Re-check the eligibility predicate under lock:
-        //   (old NotReady && new Ready)  OR  (old Ready && env changed)
-        // TODO: busy/mid-turn deferral would slot in here
-        //
-        // Reuse personas_snapshot from Phase 1 — avoids loading personas again
-        // per agent when the save-command personas haven't changed.
-        let effective_cmd = record_agent_command(record, &personas_owned);
-        let runtime_meta = known_acp_runtime(&effective_cmd);
-        let old_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &old_global_clone);
-        let new_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &new_global_clone);
-        let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
-        let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
-        // Under lock, the alive check was already done above via process_is_running.
-        let env_changed = old_ready && old_effective.env != new_effective.env;
-        if !should_restart_on_config_change(old_ready, new_ready, env_changed) {
-            return Err(format!(
-                "agent {pubkey_owned} restart condition no longer valid under lock"
-            ));
-        }
+                let effective_cmd = record_agent_command(record, &personas_owned);
+                let runtime_meta = known_acp_runtime(&effective_cmd);
+                let old_effective = resolve_effective_agent_env(
+                    record,
+                    &personas_owned,
+                    runtime_meta,
+                    &old_global_clone,
+                );
+                let new_effective = resolve_effective_agent_env(
+                    record,
+                    &personas_owned,
+                    runtime_meta,
+                    &new_global_clone,
+                );
+                let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
+                let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
+                let env_changed = old_ready && old_effective.env != new_effective.env;
+                if !should_restart_on_config_change(old_ready, new_ready, env_changed) {
+                    return Err(format!(
+                        "agent {pubkey_owned} restart condition no longer valid under lock"
+                    ));
+                }
 
-        // Stop the process.
-        let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
-        stop_managed_agent_process(&app_for_stop, record_mut, &mut runtimes)?;
-        save_managed_agents(&app_for_stop, &records)?;
+                // Stop the process.
+                let record_mut = instances
+                    .iter_mut()
+                    .find(|r| r.pubkey == pubkey_owned)
+                    .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
+                stop_managed_agent_process(&app_for_stop_closure, record_mut, &mut runtimes)?;
+                Ok((instances, runtime_keys))
+            },
+        )?;
 
-        Ok(runtime_keys)
+        Ok::<_, String>(runtime_keys)
     })
     .await;
 
@@ -378,15 +381,18 @@ async fn restart_local_agent_on_config_change(
 fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
-    let _store_guard = state
+    let store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire store lock: {e}"))?;
-    let mut records = load_managed_agents(app)?;
-    let record = find_managed_agent_mut(&mut records, pubkey)?;
-    record.last_error = Some(error.to_string());
-    record.updated_at = crate::util::now_iso();
-    save_managed_agents(app, &records)
+    let pubkey = pubkey.to_owned();
+    let error = error.to_owned();
+    crate::managed_agents::mutate_managed_agent(app, store_guard, &pubkey, move |record, _j| {
+        record.last_error = Some(error);
+        record.updated_at = crate::util::now_iso();
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 /// Pure predicate: should an agent be restarted given resolved readiness and

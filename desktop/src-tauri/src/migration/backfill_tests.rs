@@ -52,7 +52,8 @@ fn backfill_links_standalone_agent_to_manufactured_definition() {
         )]),
     );
 
-    let backfilled = backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
+    let backfilled =
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap();
     assert_eq!(backfilled, 1);
 
     let records = load_typed(dir.path());
@@ -101,7 +102,7 @@ fn backfilled_definition_carries_prompt_present_even_if_empty() {
         &serde_json::json!([standalone_agent_json("NoPrompt", &pubkey, None)]),
     );
 
-    backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
+    backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap();
 
     let records = load_typed(dir.path());
     let definition = records.iter().find(|r| r.pubkey.is_empty()).unwrap();
@@ -139,7 +140,7 @@ fn backfill_of_promptless_record_keeps_spawn_snapshot_stable() {
         &Default::default(),
     );
 
-    backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
+    backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap();
 
     let post_records = load_typed(dir.path());
     let post_instance = post_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
@@ -189,7 +190,7 @@ fn backfill_of_prompted_record_keeps_spawn_snapshot_stable() {
         &Default::default(),
     );
 
-    backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
+    backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap();
 
     let post_records = load_typed(dir.path());
     let post_instance = post_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
@@ -222,14 +223,14 @@ fn second_run_is_a_no_op_and_preserves_pristine_backup() {
     let pristine = std::fs::read_to_string(base(dir.path()).join("managed-agents.json")).unwrap();
 
     assert_eq!(
-        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
     let after_first =
         std::fs::read_to_string(base(dir.path()).join("managed-agents.json")).unwrap();
 
     assert_eq!(
-        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0,
         "second run is a no-op"
     );
@@ -257,7 +258,7 @@ fn definitions_and_linked_records_are_untouched() {
     write_agents_json(dir.path(), &serde_json::json!([linked]));
 
     assert_eq!(
-        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         0
     );
     assert!(
@@ -290,7 +291,7 @@ fn slug_collision_fails_loudly_per_record_and_continues() {
     );
 
     assert_eq!(
-        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1,
         "collision skipped, clean record backfilled"
     );
@@ -317,7 +318,7 @@ fn backfill_creates_the_backup_owner_only() {
     write_agents_json(dir.path(), &serde_json::json!([record]));
 
     assert_eq!(
-        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        backfill_standalone_agents_in_dir(&base(dir.path()), &base(dir.path())).unwrap(),
         1
     );
 
