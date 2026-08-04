@@ -279,16 +279,14 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
                 state.clear_agent_session_caches(pk);
                 // Remove nsec from keyring after the record is gone.
                 delete_agent_key(pk);
-                if let Err(e) = super::agents::tombstone_managed_agent_pending(&app, &state, pk) {
-                    eprintln!("buzz-desktop: persona-delete: agent tombstone failed for {pk}: {e}");
-                }
-                if let Err(e) = super::agents::archive_managed_agent_pending(&app, &state, pk) {
-                    eprintln!("buzz-desktop: persona-delete: agent archive failed for {pk}: {e}");
-                }
+                // Propagate: no boot-reconcile fallback for tombstone/archive.
+                super::agents::tombstone_managed_agent_pending(&app, &state, pk)
+                    .map_err(|e| format!("persona-delete: agent tombstone failed for {pk}: {e}"))?;
+                super::agents::archive_managed_agent_pending(&app, &state, pk)
+                    .map_err(|e| format!("persona-delete: agent archive failed for {pk}: {e}"))?;
             }
-            if let Err(e) = tombstone_persona_pending(&app, &state, &d_tag) {
-                eprintln!("buzz-desktop: persona-delete: tombstone failed for {d_tag}: {e}");
-            }
+            tombstone_persona_pending(&app, &state, &d_tag)
+                .map_err(|e| format!("persona-delete: tombstone failed for {d_tag}: {e}"))?;
 
             // _store_guard drops here, before try_regenerate_nest.
         }

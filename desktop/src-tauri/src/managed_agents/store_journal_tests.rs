@@ -901,22 +901,11 @@ fn empty_teams_json() -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::json!([])).unwrap()
 }
 
-fn insert_file_commit_phase_row(
-    conn: &Connection,
-    commit_id: &str,
-    phase: &str,
-    agents_stage: &str,
-    teams_stage: &str,
-) {
+fn insert_file_commit_phase_row(conn: &Connection, cid: &str, phase: &str, as_: &str, ts: &str) {
     conn.execute(
-        "INSERT INTO file_commit_phases
-             (commit_id, operation_id, phase,
-              agents_stage_path, teams_stage_path,
-              created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
-        rusqlite::params![commit_id, commit_id, phase, agents_stage, teams_stage],
-    )
-    .unwrap();
+        "INSERT INTO file_commit_phases (commit_id,operation_id,phase,agents_stage_path,teams_stage_path,agents_content_hash,teams_content_hash,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'','',0,0)",
+        rusqlite::params![cid, cid, phase, as_, ts],
+    ).unwrap();
 }
 
 /// Three crash scenarios for the two-phase file-commit protocol (intent,

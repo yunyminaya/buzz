@@ -198,18 +198,27 @@ where
 
         // Insert the file-commit intent row.  This is the durable record that
         // recovery uses to identify an interrupted two-phase commit.
+        // Content hashes allow recovery to verify a canonical file after a
+        // missing-stage scenario: if the canonical hash matches the recorded
+        // hash, the rename completed; otherwise fail closed.
+        use sha2::Digest;
+        let agents_hash = hex::encode(sha2::Sha256::digest(&agents_payload));
+        let teams_hash = hex::encode(sha2::Sha256::digest(&teams_payload));
         let now = unix_now_secs();
         tx.execute(
             "INSERT INTO file_commit_phases
                  (commit_id, operation_id, phase,
                   agents_stage_path, teams_stage_path,
+                  agents_content_hash, teams_content_hash,
                   created_at, updated_at)
-             VALUES (?1, ?2, 'intent', ?3, ?4, ?5, ?5)",
+             VALUES (?1, ?2, 'intent', ?3, ?4, ?5, ?6, ?7, ?7)",
             params![
                 commit_id,
                 commit_id, // operation_id == commit_id for phase records
                 agents_stage.to_string_lossy().as_ref(),
                 teams_stage.to_string_lossy().as_ref(),
+                agents_hash,
+                teams_hash,
                 now,
             ],
         )
@@ -476,22 +485,35 @@ fn canonical_from_stage(stage: &Path) -> std::path::PathBuf {
 ///
 /// Called before `recover_nonterminal_operations` so the JSON files are in a
 /// consistent state before publication recovery reads or reconciles them.
+/// Compute the SHA-256 hash of a file's contents, or `None` if the file cannot
+/// be read. Used by recovery to verify canonical files match recorded hashes.
+fn sha256_hex_of_file(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let bytes = std::fs::read(path).ok()?;
+    Some(hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
+#[allow(clippy::type_complexity)]
 fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<(), String> {
-    let rows: Vec<(String, String, String, String)> = {
+    // Read commit_id, phase, stage paths, AND content hashes.
+    let rows: Vec<(String, String, String, String, String, String)> = {
         let mut stmt = journal
             .prepare(
-                "SELECT commit_id, phase, agents_stage_path, teams_stage_path
+                "SELECT commit_id, phase, agents_stage_path, teams_stage_path,
+                        agents_content_hash, teams_content_hash
                  FROM file_commit_phases
                  WHERE phase != 'committed'",
             )
             .map_err(|e| format!("prepare file_commit_phases query: {e}"))?;
-        let collected: Vec<rusqlite::Result<(String, String, String, String)>> = stmt
-            .query_map([], |row| {
+        let collected: Vec<rusqlite::Result<(String, String, String, String, String, String)>> =
+            stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|e| format!("query file_commit_phases: {e}"))?
@@ -502,7 +524,7 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
             .map_err(|e| format!("read file_commit_phases row: {e}"))?
     };
 
-    for (commit_id, phase_str, agents_stage_str, teams_stage_str) in rows {
+    for (commit_id, phase_str, agents_stage_str, teams_stage_str, agents_hash, teams_hash) in rows {
         let phase = FileCommitPhase::from_str(&phase_str).unwrap_or(FileCommitPhase::Intent);
         let agents_stage = std::path::PathBuf::from(&agents_stage_str);
         let teams_stage = std::path::PathBuf::from(&teams_stage_str);
@@ -511,22 +533,36 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
             "buzz-desktop: boot-recovery: interrupted file commit {commit_id} phase={phase_str}"
         );
 
+        let agents_canonical = canonical_from_stage(&agents_stage);
+        let teams_canonical = canonical_from_stage(&teams_stage);
+
         match phase {
             FileCommitPhase::Intent => {
                 // Both stage files should exist for a full intent commit.
-                // Handle each case explicitly to avoid certifying missing data.
                 let agents_exists = agents_stage.exists();
                 let teams_exists = teams_stage.exists();
                 if !agents_exists && !teams_exists {
-                    // Both missing: both renames likely already completed but
-                    // the phase record update was lost. Advance to committed.
-                    eprintln!(
-                        "buzz-desktop: boot-recovery: {commit_id}: both stage files absent                          in intent phase — advancing to committed (renames likely completed)"
-                    );
-                    advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
-                        .unwrap_or_else(|e| {
-                            eprintln!("buzz-desktop: boot-recovery: advance committed failed: {e}")
-                        });
+                    // Both stage files absent. Verify the canonical files match
+                    // the recorded hashes — proof both renames completed.
+                    let agents_ok = !agents_hash.is_empty()
+                        && sha256_hex_of_file(&agents_canonical).as_deref() == Some(&agents_hash);
+                    let teams_ok = !teams_hash.is_empty()
+                        && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
+                    if agents_ok && teams_ok {
+                        eprintln!(
+                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent,                              canonicals verified — advancing to committed"
+                        );
+                        advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
+                            .unwrap_or_else(|e| {
+                                eprintln!(
+                                    "buzz-desktop: boot-recovery: advance committed failed: {e}"
+                                )
+                            });
+                    } else {
+                        eprintln!(
+                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent                              in intent phase and canonicals do not match recorded hashes —                              failing closed; manual recovery may be needed"
+                        );
+                    }
                     continue;
                 }
                 if !agents_exists {
@@ -539,8 +575,7 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                     continue;
                 }
                 // Agents stage exists — replay agents rename.
-                let canonical = canonical_from_stage(&agents_stage);
-                if let Err(e) = rename_staged(&agents_stage, &canonical) {
+                if let Err(e) = rename_staged(&agents_stage, &agents_canonical) {
                     eprintln!("buzz-desktop: boot-recovery: agents rename failed: {e}");
                     continue;
                 }
@@ -551,14 +586,23 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                 }
                 // Teams rename.
                 if teams_exists {
-                    let canonical = canonical_from_stage(&teams_stage);
-                    if let Err(e) = rename_staged(&teams_stage, &canonical) {
+                    if let Err(e) = rename_staged(&teams_stage, &teams_canonical) {
                         eprintln!("buzz-desktop: boot-recovery: teams rename failed: {e}");
                         continue;
                     }
+                } else {
+                    // Teams stage absent after agents rename. Verify via hash.
+                    let teams_ok = !teams_hash.is_empty()
+                        && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
+                    if !teams_ok {
+                        eprintln!(
+                            "buzz-desktop: boot-recovery: {commit_id}: teams stage absent \
+                             in intent phase (after agents rename) and canonical does not \
+                             match recorded hash — failing closed"
+                        );
+                        continue;
+                    }
                 }
-                // Teams stage absent after agents rename: teams rename already
-                // completed. Either way, record committed.
                 advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
                     .unwrap_or_else(|e| {
                         eprintln!("buzz-desktop: boot-recovery: advance committed failed: {e}")
@@ -567,15 +611,25 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
             FileCommitPhase::FirstRenamed => {
                 // Agents already renamed; only teams stage remains.
                 if teams_stage.exists() {
-                    let canonical = canonical_from_stage(&teams_stage);
-                    if let Err(e) = rename_staged(&teams_stage, &canonical) {
+                    if let Err(e) = rename_staged(&teams_stage, &teams_canonical) {
                         eprintln!(
                             "buzz-desktop: boot-recovery: teams rename (first_renamed) failed: {e}"
                         );
                         continue;
                     }
+                    // Teams rename succeeded — advance to committed.
+                } else {
+                    // Teams stage absent. Verify via recorded hash.
+                    let teams_ok = !teams_hash.is_empty()
+                        && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
+                    if !teams_ok {
+                        eprintln!(
+                            "buzz-desktop: boot-recovery: {commit_id}: teams stage absent in                              first_renamed phase and canonical does not match recorded hash —                              failing closed; manual recovery may be needed"
+                        );
+                        continue;
+                    }
+                    // Canonical matches — teams rename already completed.
                 }
-                // Teams stage absent: teams rename already completed.
                 advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
                     .unwrap_or_else(|e| {
                         eprintln!("buzz-desktop: boot-recovery: advance committed failed: {e}")

@@ -320,18 +320,16 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
         // delete_team_with_cascade rejects built-in teams via validate_team_deletion,
         // so reaching here means this team was owner-published — tombstone it. The
         // d_tag is the team id, captured before the record left the store.
-        if let Err(e) = tombstone_team_pending(&app, &state, &id) {
-            eprintln!("buzz-desktop: team-delete: tombstone failed for {id}: {e}");
-        }
+        // Propagate: no boot-reconcile fallback for tombstones.
+        tombstone_team_pending(&app, &state, &id).map_err(|e| {
+            format!("team deleted but tombstone failed — relay record may persist: {e}")
+        })?;
         // Tombstone the cascaded personas too, so their orphaned kind:30175 heads
         // don't linger on the relay (F4). Each d-tag was captured pre-removal.
         for persona_d_tag in &cascaded_persona_d_tags {
-            if let Err(e) = super::personas::tombstone_persona_pending(&app, &state, persona_d_tag)
-            {
-                eprintln!(
-                    "buzz-desktop: team-delete: persona tombstone failed for {persona_d_tag}: {e}"
-                );
-            }
+            super::personas::tombstone_persona_pending(&app, &state, persona_d_tag).map_err(
+                |e| format!("team-delete: persona tombstone failed for {persona_d_tag}: {e}"),
+            )?;
         }
         try_regenerate_nest(&app);
         Ok(())

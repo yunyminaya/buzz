@@ -1310,20 +1310,15 @@ pub async fn delete_managed_agent(
             // guard above and a confirmed removal — never orphan a live remote
             // deployment's relay record. Inside the lock, before the block closes
             // (no .await here). Every agent published, so every delete tombstones.
-            if let Err(e) = tombstone_managed_agent_pending(&app, &state, &pubkey) {
-                eprintln!(
-                    "buzz-desktop: agent-delete: tombstone failed for {pubkey}: {e} — \
-                     relay record may persist until next boot reconcile"
-                );
-            }
+            // Propagate failure: a deleted agent has no boot-reconcile fallback
+            // for its tombstone — without outbox evidence the tombstone is lost.
+            tombstone_managed_agent_pending(&app, &state, &pubkey)
+                .map_err(|e| format!("agent deleted but tombstone failed — relay record may persist: {e}"))?;
             // NIP-IA: archive the deleted agent's identity on the relay so it
-            // stops appearing in member pickers and autocomplete. Same
-            // best-effort, inside-the-lock contract as the tombstone above.
-            if let Err(e) = archive_managed_agent_pending(&app, &state, &pubkey) {
-                eprintln!(
-                    "buzz-desktop: agent-delete: archive failed for {pubkey}: {e}"
-                );
-            }
+            // stops appearing in member pickers and autocomplete.
+            // Also propagate: no reconcile fallback for archive events.
+            archive_managed_agent_pending(&app, &state, &pubkey)
+                .map_err(|e| format!("agent deleted but archive failed: {e}"))?;
         }
         try_regenerate_nest(&app);
         Ok(())

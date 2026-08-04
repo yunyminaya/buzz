@@ -99,6 +99,12 @@ pub(crate) fn retain_managed_agent_pending(
         )
     })();
     if let Err(e) = result {
+        // Update-retain failures are logged and swallowed: the agent record is
+        // already durably written to the JSON store, and boot reconcile
+        // (`reconcile_agents_to_events`) will re-enqueue the publication on
+        // next launch.  This is the accepted boot-reconcile-recoverable contract
+        // for live-content updates (Thufir pass-3 review: "acceptable for updates,
+        // not deletes"). Tombstones/archives use propagating Result instead.
         eprintln!("buzz-desktop: agent-retain: {e}");
     }
 }

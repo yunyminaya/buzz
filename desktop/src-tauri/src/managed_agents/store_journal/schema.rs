@@ -100,22 +100,37 @@ pub(super) fn apply_journal_schema(conn: &Connection) -> Result<(), String> {
         -- agents_stage_path / teams_stage_path name the temp files written
         -- before rename. Recovery checks for them to decide what remains to do.
         CREATE TABLE IF NOT EXISTS file_commit_phases (
-            commit_id         TEXT NOT NULL PRIMARY KEY,
-            operation_id      TEXT NOT NULL,
-            phase             TEXT NOT NULL DEFAULT 'intent',
-            agents_stage_path TEXT NOT NULL,
-            teams_stage_path  TEXT NOT NULL,
-            created_at        INTEGER NOT NULL,
-            updated_at        INTEGER NOT NULL
+            commit_id           TEXT NOT NULL PRIMARY KEY,
+            operation_id        TEXT NOT NULL,
+            phase               TEXT NOT NULL DEFAULT 'intent',
+            agents_stage_path   TEXT NOT NULL,
+            teams_stage_path    TEXT NOT NULL,
+            agents_content_hash TEXT NOT NULL DEFAULT '',
+            teams_content_hash  TEXT NOT NULL DEFAULT '',
+            created_at          INTEGER NOT NULL,
+            updated_at          INTEGER NOT NULL
         );
         ",
     )
     .map_err(|e| format!("apply journal schema: {e}"))?;
 
-    // Set schema version via PRAGMA user_version (authoritative singleton,
-    // never duplicated).
-    conn.pragma_update(None, "user_version", 2)
-        .map_err(|e| format!("set schema user_version: {e}"))?;
+    // Schema version 3: add content-hash columns for verifiable file-commit
+    // recovery. ALTER TABLE ... ADD COLUMN is ignored on fresh DBs (columns
+    // already exist from CREATE TABLE above).
+    let current_version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap_or(0);
+    if current_version < 3 {
+        let _ = conn.execute_batch(
+            "ALTER TABLE file_commit_phases ADD COLUMN agents_content_hash TEXT NOT NULL DEFAULT '';
+             ALTER TABLE file_commit_phases ADD COLUMN teams_content_hash  TEXT NOT NULL DEFAULT '';",
+        );
+        conn.pragma_update(None, "user_version", 3)
+            .map_err(|e| format!("bump schema user_version to 3: {e}"))?;
+    } else {
+        conn.pragma_update(None, "user_version", 3)
+            .map_err(|e| format!("set schema user_version: {e}"))?;
+    }
 
     Ok(())
 }

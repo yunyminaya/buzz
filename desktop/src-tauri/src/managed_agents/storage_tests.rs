@@ -830,3 +830,39 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
         );
     }
 }
+
+// ── Fix 2: keyring chokepoint round-trip ─────────────────────────────────────
+
+/// Fix 2: `persist_agent_keys_with` strips nsec on healthy keyring.
+#[test]
+fn persist_agent_keys_strips_nsec_on_healthy_keyring() {
+    let store = FakeKeyStore::reachable();
+    let mut record = record_with_pubkey_and_key("aabbcc", "nsec1abc");
+    persist_agent_keys_with(&store, std::slice::from_mut(&mut record));
+    assert!(
+        record.private_key_nsec.is_empty(),
+        "healthy keyring: nsec must be stripped"
+    );
+    assert_eq!(
+        store
+            .stored
+            .borrow()
+            .get(&agent_keyring_name("aabbcc"))
+            .cloned(),
+        Some("nsec1abc".to_string()),
+        "healthy keyring: nsec must be in keyring"
+    );
+}
+
+/// Fix 2: `persist_agent_keys_with` keeps nsec inline when keyring unreachable.
+#[test]
+fn persist_agent_keys_keeps_nsec_inline_when_keyring_unreachable() {
+    let store = FakeKeyStore::unreachable();
+    let mut record = record_with_pubkey_and_key("aabbcc", "nsec1abc");
+    persist_agent_keys_with(&store, std::slice::from_mut(&mut record));
+    assert_eq!(
+        record.private_key_nsec, "nsec1abc",
+        "unreachable: nsec stays inline"
+    );
+    assert!(store.stored.borrow().is_empty());
+}

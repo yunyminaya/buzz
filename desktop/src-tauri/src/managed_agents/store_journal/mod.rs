@@ -76,3 +76,7 @@ pub use writer::{atomic_write_restricted_with_fsync, atomic_write_with_fsync};
 #[cfg(test)]
 #[path = "../store_journal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../store_journal_fix_tests.rs"]
+mod fix_tests;
