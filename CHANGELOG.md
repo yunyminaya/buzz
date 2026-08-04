@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Desktop and shared changes
+
+- feat(desktop): add in-app admin console for relay operators — NIP-98 client for deployment-wide reports and product feedback (`Settings → Admin console`)
+
 ## v0.5.5
 
 ### Desktop and shared changes
@@ -44,7 +50,6 @@
 - fix(mobile): recover stale relay sessions ([#4372](https://github.com/block/buzz/pull/4372)) ([`ce56e34411d2940e70a6c0de653ffae36d334701`](https://github.com/block/buzz/commit/ce56e34411d2940e70a6c0de653ffae36d334701))
 
 [Compare desktop-v0.5.4...desktop-v0.5.5](https://github.com/block/buzz/compare/desktop-v0.5.4...desktop-v0.5.5)
-
 ## v0.5.4
 
 ### Desktop and shared changes
