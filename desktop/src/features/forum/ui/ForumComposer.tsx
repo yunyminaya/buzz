@@ -36,6 +36,7 @@ import { useCompactComposerInteractions } from "./useCompactComposerInteractions
 
 export function ForumComposer({
   channelId = null,
+  channelType,
   members,
   className,
   placeholder,
@@ -69,7 +70,7 @@ export function ForumComposer({
     if (compact) setIsCompactExpanded(true);
   }, [compact]);
 
-  const mentions = useMentions(channelId, members, profiles);
+  const mentions = useMentions(channelId, members, profiles, { channelType });
   const channelLinks = useChannelLinks();
   const media = useMediaUpload();
   const { handlePaperclipClick, handleToolbarMouseDown, shouldIgnoreBlur } =
@@ -113,6 +114,7 @@ export function ForumComposer({
     editable: !disabled,
     mentionNames: mentions.knownNames,
     channelNames: channelLinks.knownChannelNames,
+    messageLinkChannels: channelLinks.channels,
     onSubmit: () => submitMessageRef.current(),
     isAutocompleteOpen: isAutocompleteOpenRef,
     onEditLink: (info) => onEditLinkRef.current?.(info),

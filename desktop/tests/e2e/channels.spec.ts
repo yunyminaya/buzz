@@ -2775,6 +2775,109 @@ test("Inbox All excludes generic channel traffic", async ({ page }) => {
   ).toHaveCount(0);
 });
 
+test("Inbox type labels keep the same height with and without a channel chip", async ({
+  page,
+}) => {
+  const dmId = "inbox-type-label-dm";
+  const mentionId = "inbox-type-label-mention";
+  const dmChannelId = "f48efb06-0c93-5025-aac9-2e646bb6bfa8";
+
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  await page.waitForFunction(() => {
+    const win = window as MockFeedWindow;
+    return (
+      typeof win.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function" &&
+      typeof win.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__ === "function"
+    );
+  });
+
+  await page.evaluate(
+    ({
+      channelId,
+      currentPubkey,
+      dmChannelId: directChannelId,
+      dmId: directId,
+      mentionId: channelMentionId,
+      senderPubkey,
+    }) => {
+      const win = window as MockFeedWindow;
+      const emitMessage = win.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      const pushFeedItem = win.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__;
+      if (!emitMessage || !pushFeedItem) {
+        throw new Error("Mock bridge helpers are not installed.");
+      }
+
+      const createdAt = Math.floor(Date.now() / 1_000);
+      const directMessage = emitMessage({
+        channelName: "alice-tyler",
+        content: "A direct message without a channel chip",
+        createdAt,
+        id: directId,
+        pubkey: senderPubkey,
+      });
+      pushFeedItem({
+        category: "activity",
+        channel_id: directChannelId,
+        channel_name: "alice-tyler",
+        channel_type: null,
+        content: directMessage.content,
+        created_at: directMessage.created_at,
+        id: directMessage.id,
+        kind: directMessage.kind,
+        pubkey: directMessage.pubkey,
+        tags: directMessage.tags,
+      });
+      pushFeedItem({
+        category: "mention",
+        channel_id: channelId,
+        channel_name: "general",
+        channel_type: "stream",
+        content: "A channel mention with a channel chip",
+        created_at: createdAt + 1,
+        id: channelMentionId,
+        kind: 9,
+        pubkey: senderPubkey,
+        tags: [
+          ["h", channelId],
+          ["p", currentPubkey],
+        ],
+      });
+    },
+    {
+      channelId: GENERAL_CHANNEL_ID,
+      currentPubkey: MOCK_IDENTITY_PUBKEY,
+      dmChannelId,
+      dmId,
+      mentionId,
+      senderPubkey: TEST_IDENTITIES.alice.pubkey,
+    },
+  );
+
+  const dmLabel = page
+    .getByTestId(`home-inbox-item-${dmId}`)
+    .locator('[data-inbox-type-label=""]');
+  const mentionLabel = page
+    .getByTestId(`home-inbox-item-${mentionId}`)
+    .locator('[data-inbox-type-label=""]');
+  await expect(dmLabel).toContainText("DM from alice");
+  await expect(dmLabel.locator('[data-channel-link=""]')).toHaveCount(0);
+  await expect(mentionLabel).toContainText("Mentioned in");
+  await expect(mentionLabel.locator('[data-channel-link=""]')).toHaveText(
+    "#general",
+  );
+
+  const [dmBox, mentionBox] = await Promise.all([
+    dmLabel.boundingBox(),
+    mentionLabel.boundingBox(),
+  ]);
+  expect(dmBox).not.toBeNull();
+  expect(mentionBox).not.toBeNull();
+  expect(
+    Math.abs((dmBox?.height ?? 0) - (mentionBox?.height ?? 0)),
+  ).toBeLessThan(0.5);
+});
+
 test("Inbox All never lists drafts and unread-only hides reminders", async ({
   page,
 }) => {
@@ -3394,6 +3497,84 @@ test("home inbox manage affordance opens management without leaving home", async
   await expect(page).not.toHaveURL(/#\/channels\//);
 });
 
+test("members sidebar virtualizes large channel rosters", async ({ page }) => {
+  await page.goto("/");
+  const channelId = await page
+    .getByTestId("channel-random")
+    .getAttribute("data-channel-id");
+  if (!channelId) {
+    throw new Error("Random channel id missing.");
+  }
+
+  const pubkeys = Array.from({ length: 500 }, (_, index) =>
+    (index + 1).toString(16).padStart(64, "0"),
+  );
+  await invokeMockCommand(page, "add_channel_members", {
+    channelId,
+    pubkeys,
+    role: "member",
+  });
+
+  await openMembersSidebar(page, "random");
+  const memberList = page.getByTestId("members-sidebar-people");
+  const memberRows = memberList.locator('[data-testid^="sidebar-member-"]');
+  await expect(memberRows.first()).toBeVisible();
+  expect(await memberRows.count()).toBeLessThan(50);
+
+  const virtualizedList = memberList.locator(".overflow-y-auto");
+  await virtualizedList.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(
+    memberList.getByTestId(`sidebar-member-${pubkeys.at(-1)}`),
+  ).toBeVisible();
+});
+
+test("members sidebar can invite relay-authorized agents", async ({ page }) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        name: "quinn",
+        respondTo: "allowlist",
+        respondToAllowlist: [MOCK_IDENTITY_PUBKEY],
+      },
+    ],
+  });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill("quinn");
+
+  await expect(
+    page.getByTestId(`channel-user-search-result-${DM_RELAY_AGENT_PUBKEY}`),
+  ).toBeVisible();
+});
+
+test("members sidebar hides relay agents that are not authorized", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        name: "quinn",
+        respondTo: "allowlist",
+        respondToAllowlist: [TEST_IDENTITIES.outsider.pubkey],
+      },
+    ],
+  });
+  await page.goto("/");
+  await openMembersSidebar(page, "general");
+
+  await page.getByTestId("channel-management-search-users").fill("quinn");
+
+  await expect(
+    page.getByTestId(`channel-user-search-result-${DM_RELAY_AGENT_PUBKEY}`),
+  ).toHaveCount(0);
+});
+
 test("members sidebar can invite and remove managed agents", async ({
   page,
 }) => {
@@ -3696,7 +3877,7 @@ test("channel header actions show tooltips", async ({ page }) => {
   }
 });
 
-test("members sidebar collapses same-persona managed agents", async ({
+test("members sidebar retains distinct same-persona managed agents", async ({
   page,
 }) => {
   const inChannelAgentPubkey =
@@ -3746,8 +3927,8 @@ test("members sidebar collapses same-persona managed agents", async ({
   ).toHaveCount(0);
   await expect(
     page.getByTestId(`channel-user-search-result-${outOfChannelAgentPubkey}`),
-  ).toHaveCount(0);
-  await expect(page.getByText("Pinky", { exact: true })).toHaveCount(1);
+  ).toBeVisible();
+  await expect(page.getByText("Pinky", { exact: true })).toHaveCount(2);
 });
 
 test("private-channel members can add people and managed agents without admin", async ({
@@ -3764,14 +3945,47 @@ test("private-channel members can add people and managed agents without admin", 
   });
   await page.goto("/");
   // secret-projects is a private (non-DM) channel where the current user is a
-  // plain member, not owner/admin. They should still be able to add members
-  // and bots — only granting elevated roles is reserved for owners/admins.
+  // plain member. Active members may add ordinary members and bots; only
+  // elevated-role grants and role changes require owner/admin authority.
   await openMembersSidebar(page, "secret-projects");
 
-  // The invite card is shown to any member, not just owners/admins.
+  await expect(page.getByTestId("members-sidebar-add-denied")).toHaveCount(0);
+  await expect(
+    page.getByTestId("channel-management-search-users"),
+  ).toHaveAttribute("placeholder", "Add people and agents");
+
+  await page.getByTestId("channel-management-search-users").fill("char");
+  await page
+    .getByTestId(`channel-user-search-result-${TEST_IDENTITIES.charlie.pubkey}`)
+    .click();
+  await expect(
+    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toContainText("charlie");
+});
+
+test("open-channel members can add people and managed agents without admin", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: TEST_IDENTITIES.charlie.pubkey,
+        name: "charlie",
+        status: "stopped",
+      },
+    ],
+  });
+  await page.goto("/");
+  // random is open and the current user is a plain member there, so the
+  // owner/admin requirement must not leak outside private channels.
+  await openMembersSidebar(page, "random");
+
+  // The invite card is shown to any member of an open channel, not just
+  // owners/admins.
   await expect(
     page.getByTestId("channel-management-search-users"),
   ).toBeVisible();
+  await expect(page.getByTestId("members-sidebar-add-denied")).toHaveCount(0);
   await page.getByTestId("channel-management-search-users").fill("char");
   await page
     .getByTestId(`channel-user-search-result-${TEST_IDENTITIES.charlie.pubkey}`)

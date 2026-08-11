@@ -3138,6 +3138,80 @@ void main() {
       expect(publishedEvents.where((event) => event['kind'] == 9000), isEmpty);
     });
 
+    testWidgets(
+      'adds the agent in a private channel when the sender is a plain member',
+      (tester) async {
+        final agentPubkey = 'a' * 64;
+        final signer = nostr.Keys.generate();
+        final publishedEvents = <Map<String, dynamic>>[];
+        var didSend = false;
+        List<String> sentMentionPubkeys = const <String>[];
+        List<List<String>> sentMediaTags = const <List<String>>[];
+
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _testUploadService(signer.nsec),
+            currentPubkey: signer.public,
+            // Plain member of a private channel: ordinary member and bot
+            // additions are permitted; elevated-role grants still are not.
+            members: [
+              ChannelMember(
+                pubkey: signer.public,
+                role: 'member',
+                joinedAt: DateTime(2024),
+              ),
+            ],
+            relayAgents: [_testAgent(agentPubkey)],
+            channels: [
+              _makeCurrentChannel(visibility: 'private'),
+              _makeSharedMemberChannel(),
+            ],
+            onSend:
+                (
+                  content,
+                  mentionPubkeys, {
+                  mediaTags = const <List<String>>[],
+                }) async {
+                  didSend = true;
+                  sentMentionPubkeys = mentionPubkeys;
+                  sentMediaTags = mediaTags;
+                },
+          ),
+        );
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(ComposeBar)),
+        );
+        final session = container.read(relaySessionProvider.notifier);
+        final socket = _RecordingRelaySocket(
+          publishedEvents,
+          session.debugHandleSocketMessageForTest,
+        );
+        session.debugAttachSocketForTest(socket);
+
+        await _expandComposer(tester);
+        await tester.enterText(find.byType(TextField), '@hel');
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Helper Bot'));
+        await tester.pumpAndSettle();
+        await tester.enterText(find.byType(TextField), 'hello @Helper Bot');
+        await tester.tap(find.byIcon(LucideIcons.arrowUp));
+        await tester.pumpAndSettle();
+
+        expect(didSend, isTrue);
+        expect(
+          publishedEvents.where((event) => event['kind'] == 9000),
+          hasLength(1),
+        );
+        expect(sentMentionPubkeys, contains(agentPubkey));
+        expect(
+          sentMediaTags,
+          isNot(contains(orderedEquals(['mention', agentPubkey]))),
+        );
+        expect(find.text(privateChannelAddDeniedMessage), findsNothing);
+      },
+    );
+
     testWidgets('adds a sanitized animated PNG attachment', (tester) async {
       final keychain = nostr.Keys.generate();
       final nsec = keychain.nsec;
@@ -3489,12 +3563,15 @@ List<({String text, TextStyle style})> _flattenStyledTextSpans(
   return result;
 }
 
-Channel _makeCurrentChannel({String channelType = 'stream'}) {
+Channel _makeCurrentChannel({
+  String channelType = 'stream',
+  String visibility = 'open',
+}) {
   return Channel(
     id: 'channel-1',
     name: 'current',
     channelType: channelType,
-    visibility: 'open',
+    visibility: visibility,
     description: '',
     createdBy: 'pubkey123',
     createdAt: DateTime(2024),
