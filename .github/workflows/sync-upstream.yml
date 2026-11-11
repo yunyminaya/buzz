@@ -1,0 +1,42 @@
+# sincroniza-el-fork-con-el-original (Atencora sync)
+# Mantiene este fork al día con block/buzz.
+# Corre en los servidores de GitHub (no necesita tu Mac encendida).
+name: Sync con el original
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # todos los días, 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Traer el original
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fusionar sin forzar
+        run: |
+          set -euo pipefail
+          git config user.name  "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/block/buzz.git" || true
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Ya está al día con block/buzz."
+            exit 0
+          fi
+          # --no-edit: si el fork tiene commits propios, deja un merge limpio.
+          # Si hay conflicto real, el job falla en rojo y NO se toca nada.
+          git merge --no-edit FETCH_HEAD
+          git push origin HEAD:main
